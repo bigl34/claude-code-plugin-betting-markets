@@ -1,7 +1,7 @@
 ---
 name: betting-markets-manager
 description: Use this agent for searching and aggregating betting/prediction markets from Polymarket, Kalshi, and Betfair. Returns formatted tables with odds (%) and volume (USD).
-model: haiku
+model: opus
 color: purple
 ---
 
