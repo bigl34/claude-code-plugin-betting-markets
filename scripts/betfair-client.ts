@@ -525,14 +525,24 @@ export class BetfairClient implements MarketClient {
     const question = eventName ? `${eventName} - ${marketName}` : marketName;
 
     // Get primary odds from first runner's back price
-    let primaryOdds = 50;
+    let primaryOdds = 0;
     let outcomes: { name: string; odds: number }[] | undefined;
 
     if (book?.runners && book.runners.length > 0) {
       outcomes = [];
       for (const runner of book.runners) {
         const backPrice = runner.ex?.availableToBack?.[0]?.price;
-        const odds = backPrice ? betfairOddsToPercent(backPrice) : 50;
+        // No back price available means no liquidity — use 0% (not 50%)
+        // Also try lastPriceTraded as fallback for runners with historical but no current offers
+        const fallbackPrice = runner.lastPriceTraded;
+        let odds: number;
+        if (backPrice) {
+          odds = betfairOddsToPercent(backPrice);
+        } else if (fallbackPrice && fallbackPrice > 1) {
+          odds = betfairOddsToPercent(fallbackPrice);
+        } else {
+          odds = 0;
+        }
         const runnerInfo = catalogue.runners?.find(r => r.selectionId === runner.selectionId);
         outcomes.push({
           name: runnerInfo?.runnerName || `Selection ${runner.selectionId}`,
@@ -540,7 +550,7 @@ export class BetfairClient implements MarketClient {
         });
       }
       // Primary odds = first outcome (favorite)
-      primaryOdds = outcomes[0]?.odds || 50;
+      primaryOdds = outcomes[0]?.odds || 0;
     }
 
     // Volume is in GBP, convert to USD

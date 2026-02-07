@@ -95,17 +95,6 @@ The CLI outputs JSON for programmatic use. The `format-table` command outputs a 
 - For financial data → suggest `xero-accounting-manager`
 
 ## Self-Documentation
-
-Log issues and discoveries to: `/home/USER/biz/plugin-learnings/betting-markets-manager.md`
-
-### Auto-Logging Triggers
-- **Errors**: API failures, auth issues, unexpected responses
-- **Discoveries**: API quirks, rate limits, undocumented behavior
-
-### Format
-```markdown
-### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief description
-**Context**: What you were doing
-**Problem/Finding**: What happened
-**Resolution**: How to handle it
-```
+Log API quirks/errors to: `/home/USER/biz/plugin-learnings/betting-markets-manager.md`
+Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
+Full workflow: `~/biz/docs/reference/agent-shared-context.md`
