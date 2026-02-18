@@ -8,7 +8,14 @@
  * Exchange URL: https://api.betfair.com/exchange/betting/rest/v1.0
  */
 
-import type { UnifiedMarket, MarketClient, SearchOptions, BetfairConfig, Outcome } from './types.js';
+import type {
+  UnifiedMarket, MarketClient, SearchOptions, BetfairConfig, Outcome,
+  AccountFundsResponse, StatementItem, AccountStatementReport,
+  CurrentOrderSummary, CurrentOrderSummaryReport,
+  ClearedOrderSummary, ClearedOrderSummaryReport,
+  OrderProjection, OrderBy, SortDir, BetStatus, Side, GroupBy,
+  BetfairTimeRange,
+} from './types.js';
 import { betfairOddsToPercent, gbpToUsd, nowISO } from './utils.js';
 import { readFileSync } from 'fs';
 import https from 'https';
@@ -90,6 +97,7 @@ export class BetfairClient implements MarketClient {
   private ssoUrl: string;
   private certSsoUrl: string;
   private baseUrl: string;
+  private accountBaseUrl: string;
   private appKey: string;
   private username: string;
   private password: string;
@@ -106,6 +114,7 @@ export class BetfairClient implements MarketClient {
     this.ssoUrl = config.ssoUrl || 'https://identitysso.betfair.com/api';
     this.certSsoUrl = config.certSsoUrl || 'https://identitysso-cert.betfair.com/api';
     this.baseUrl = config.baseUrl || 'https://api.betfair.com/exchange/betting/rest/v1.0';
+    this.accountBaseUrl = config.accountBaseUrl || this.baseUrl.replace('/betting/', '/account/');
     this.appKey = config.appKey || '';
     this.username = config.username || '';
     this.password = config.password || '';
@@ -515,6 +524,193 @@ export class BetfairClient implements MarketClient {
       console.error('Betfair listEventTypes error:', error);
       throw error;
     }
+  }
+
+  // =============================================================================
+  // Account & Order API Methods
+  // =============================================================================
+
+  /**
+   * Generic POST helper for Betfair JSON-RPC style endpoints.
+   * Handles auth, error parsing, and typed response.
+   */
+  private async apiPost<T>(url: string, body: Record<string, any> = {}): Promise<T> {
+    const authed = await this.ensureAuth();
+    if (!authed) {
+      throw new Error('Betfair authentication failed');
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorCode: string | undefined;
+      try {
+        const errorJson = JSON.parse(errorText);
+        errorCode = errorJson?.detail?.APINGException?.errorCode;
+      } catch { /* not JSON */ }
+      throw new Error(errorCode || `Betfair API error: ${response.status} ${response.statusText}`);
+    }
+
+    return await response.json() as T;
+  }
+
+  /**
+   * Ensure we have a valid session (public wrapper for pre-auth pattern).
+   * Call this before Promise.allSettled() to avoid concurrent login attempts.
+   */
+  async ensureAuthenticated(): Promise<boolean> {
+    return this.ensureAuth();
+  }
+
+  /**
+   * Get account funds (balance, exposure, commission).
+   * Account API endpoint — no parameters needed.
+   */
+  async getAccountFunds(): Promise<AccountFundsResponse> {
+    return this.apiPost<AccountFundsResponse>(
+      `${this.accountBaseUrl}/getAccountFunds/`,
+      {}
+    );
+  }
+
+  /**
+   * Get account statement (transaction history).
+   * Account API — paginated.
+   */
+  async getAccountStatement(options: {
+    itemDateRange?: BetfairTimeRange;
+    includeItem?: string;
+    fromRecord?: number;
+    recordCount?: number;
+    maxPages?: number;
+  } = {}): Promise<{ items: StatementItem[]; totalFetched: number; moreAvailable: boolean }> {
+    const recordCount = options.recordCount || 100;
+    const maxPages = options.maxPages || 1;
+    let fromRecord = options.fromRecord || 0;
+    const allItems: StatementItem[] = [];
+    let moreAvailable = false;
+
+    for (let page = 0; page < maxPages; page++) {
+      const body: Record<string, any> = { fromRecord, recordCount };
+      if (options.itemDateRange) body.itemDateRange = options.itemDateRange;
+      if (options.includeItem) body.includeItem = options.includeItem;
+
+      const report = await this.apiPost<AccountStatementReport>(
+        `${this.accountBaseUrl}/getAccountStatement/`,
+        body
+      );
+
+      if (!report.accountStatement || report.accountStatement.length === 0) break;
+
+      allItems.push(...report.accountStatement);
+      moreAvailable = report.moreAvailable;
+
+      if (!moreAvailable) break;
+      fromRecord += report.accountStatement.length;
+    }
+
+    return { items: allItems, totalFetched: allItems.length, moreAvailable };
+  }
+
+  /**
+   * List current (open) orders.
+   * Betting API — paginated.
+   */
+  async getCurrentOrders(options: {
+    orderProjection?: OrderProjection;
+    marketIds?: string[];
+    dateRange?: BetfairTimeRange;
+    orderBy?: OrderBy;
+    sortDir?: SortDir;
+    fromRecord?: number;
+    recordCount?: number;
+    maxPages?: number;
+  } = {}): Promise<{ orders: CurrentOrderSummary[]; totalFetched: number; moreAvailable: boolean }> {
+    const recordCount = options.recordCount || 100;
+    const maxPages = options.maxPages || 1;
+    let fromRecord = options.fromRecord || 0;
+    const allOrders: CurrentOrderSummary[] = [];
+    let moreAvailable = false;
+
+    for (let page = 0; page < maxPages; page++) {
+      const body: Record<string, any> = { fromRecord, recordCount };
+      if (options.orderProjection) body.orderProjection = options.orderProjection;
+      if (options.marketIds) body.marketIds = options.marketIds;
+      if (options.dateRange) body.dateRange = options.dateRange;
+      if (options.orderBy) body.orderBy = options.orderBy;
+      if (options.sortDir) body.sortDir = options.sortDir;
+
+      const report = await this.apiPost<CurrentOrderSummaryReport>(
+        `${this.baseUrl}/listCurrentOrders/`,
+        body
+      );
+
+      if (!report.currentOrders || report.currentOrders.length === 0) break;
+
+      allOrders.push(...report.currentOrders);
+      moreAvailable = report.moreAvailable;
+
+      if (!moreAvailable) break;
+      fromRecord += report.currentOrders.length;
+    }
+
+    return { orders: allOrders, totalFetched: allOrders.length, moreAvailable };
+  }
+
+  /**
+   * List cleared (settled/voided/lapsed/cancelled) orders.
+   * Betting API — paginated. betStatus is required.
+   */
+  async getClearedOrders(options: {
+    betStatus: BetStatus;
+    eventTypeIds?: string[];
+    marketIds?: string[];
+    side?: Side;
+    settledDateRange?: BetfairTimeRange;
+    groupBy?: GroupBy;
+    fromRecord?: number;
+    recordCount?: number;
+    maxPages?: number;
+  }): Promise<{ orders: ClearedOrderSummary[]; totalFetched: number; moreAvailable: boolean }> {
+    const recordCount = options.recordCount || 100;
+    const maxPages = options.maxPages || 5;
+    let fromRecord = options.fromRecord || 0;
+    const allOrders: ClearedOrderSummary[] = [];
+    let moreAvailable = false;
+
+    for (let page = 0; page < maxPages; page++) {
+      const body: Record<string, any> = {
+        betStatus: options.betStatus,
+        includeItemDescription: true,
+        fromRecord,
+        recordCount,
+      };
+      if (options.eventTypeIds) body.eventTypeIds = options.eventTypeIds;
+      if (options.marketIds) body.marketIds = options.marketIds;
+      if (options.side) body.side = options.side;
+      if (options.settledDateRange) body.settledDateRange = options.settledDateRange;
+      if (options.groupBy) body.groupBy = options.groupBy;
+
+      const report = await this.apiPost<ClearedOrderSummaryReport>(
+        `${this.baseUrl}/listClearedOrders/`,
+        body
+      );
+
+      if (!report.clearedOrders || report.clearedOrders.length === 0) break;
+
+      allOrders.push(...report.clearedOrders);
+      moreAvailable = report.moreAvailable;
+
+      if (!moreAvailable) break;
+      fromRecord += report.clearedOrders.length;
+    }
+
+    return { orders: allOrders, totalFetched: allOrders.length, moreAvailable };
   }
 
   /**

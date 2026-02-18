@@ -35,6 +35,41 @@ export function betfairOddsToPercent(decimalOdds: number): number {
   return Math.round((1 / decimalOdds) * 100 * 100) / 100;
 }
 
+/**
+ * Convert decimal odds to percentage (same formula as Betfair, named for The Odds API clarity)
+ * Example: 2.50 → 40% (1/2.50 * 100)
+ */
+export function decimalOddsToPercent(decimalOdds: number): number {
+  return betfairOddsToPercent(decimalOdds);
+}
+
+/**
+ * Calculate trimmed mean implied probability from an array of decimal odds.
+ * Drops the highest and lowest outliers when 3+ bookmakers report odds,
+ * then averages the remaining values to produce a consensus probability.
+ *
+ * @param decimalOdds Array of decimal odds (e.g. [2.50, 2.60, 2.40, 2.55])
+ * @returns Consensus probability as percentage (0-100)
+ */
+export function trimmedMeanProbability(decimalOdds: number[]): number {
+  if (decimalOdds.length === 0) return 0;
+
+  // Convert all to implied probabilities
+  const probabilities = decimalOdds.map(d => decimalOddsToPercent(d));
+
+  if (probabilities.length <= 2) {
+    // With 1-2 values, just average them
+    const sum = probabilities.reduce((a, b) => a + b, 0);
+    return Math.round((sum / probabilities.length) * 100) / 100;
+  }
+
+  // Sort and drop highest + lowest (trimmed mean)
+  const sorted = [...probabilities].sort((a, b) => a - b);
+  const trimmed = sorted.slice(1, -1);
+  const sum = trimmed.reduce((a, b) => a + b, 0);
+  return Math.round((sum / trimmed.length) * 100) / 100;
+}
+
 // =============================================================================
 // Currency Conversion
 // =============================================================================
@@ -44,6 +79,17 @@ export function betfairOddsToPercent(decimalOdds: number): number {
  */
 export function gbpToUsd(gbp: number, rate: number = 1.27): number {
   return Math.round(gbp * rate * 100) / 100;
+}
+
+/**
+ * Format a GBP amount with USD equivalent
+ * Example: formatGbpWithUsd(1234.56, 1.27) → "£1,234.56 ($1,567.89)"
+ */
+export function formatGbpWithUsd(gbp: number, rate: number = 1.27): string {
+  const usd = gbpToUsd(gbp, rate);
+  const gbpStr = gbp.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const usdStr = usd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `\u00a3${gbpStr} ($${usdStr})`;
 }
 
 /**
