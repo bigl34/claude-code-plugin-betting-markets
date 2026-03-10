@@ -43,6 +43,50 @@ Run commands using: `node /Users/USER/.claude/plugins/local-marketplace/betting-
 | `cleared-orders` | List settled/voided Betfair orders | `--bet-status` (required), `--event-type-ids`, `--market-ids`, `--side`, `--date-from`, `--date-to`, `--group-by`, `--limit`, `--max-pages` |
 | `account-summary` | Betfair account dashboard (balance + orders + P&L) | |
 
+### Chart Generation
+
+Generate dark-themed PNG charts of historical probability movement over time.
+
+| Command | Description | Options |
+|---------|-------------|---------|
+| `chart` | Generate historical probability chart | `--market` (required), `--platform`, `--output`, `--width`, `--height`, `--title` |
+
+**Chart Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--market` | Market identifier — Polymarket slug, URL, or Kalshi ticker | Required |
+| `--platform` | Force platform (`polymarket` or `kalshi`) | Auto-detected |
+| `--output` | Output PNG file path | `/tmp/betting-chart-{ts}.png` |
+| `--width` | Chart width in pixels (400-3000) | 1400 |
+| `--height` | Chart height in pixels (300-2000) | 800 |
+| `--title` | Custom chart title | Event title from API |
+
+**Chart Examples:**
+
+```bash
+# Polymarket by slug
+node dist/cli.js chart --market "gorton-and-denton-by-election-winner"
+
+# Polymarket by URL
+node dist/cli.js chart --market "https://polymarket.com/event/gorton-and-denton-by-election-winner"
+
+# Kalshi by ticker
+node dist/cli.js chart --market "kalshi:PRES-2028-D"
+
+# Custom output path and title
+node dist/cli.js chart --market "gorton-and-denton-by-election-winner" --output /tmp/gorton.png --title "Gorton By-Election Odds"
+```
+
+**Historical data availability:**
+
+| Platform | History | Notes |
+|----------|---------|-------|
+| Polymarket | Full history (free) | Via Gamma + CLOB APIs, hourly resolution |
+| Kalshi | Candlesticks (free) | Hourly OHLCV via public API |
+| Betfair | Not available | No free historical API |
+| The Odds API | Not available | No historical endpoint |
+
 ### Common Options
 
 | Option | Description | Default |

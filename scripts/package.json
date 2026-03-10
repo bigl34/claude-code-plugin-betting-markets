@@ -8,8 +8,12 @@
     "start": "node dist/cli.js"
   },
   "dependencies": {
+    "@local/cli-utils": "github:bigl34/claude-code-plugin-shared",
     "@local/plugin-cache": "github:bigl34/claude-code-plugin-cache",
-    "@local/cli-utils": "github:bigl34/claude-code-plugin-shared"
+    "@napi-rs/canvas": "^0.1.95",
+    "chart.js": "^4.5.1",
+    "chartjs-adapter-date-fns": "^3.0.0",
+    "date-fns": "^3.6.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

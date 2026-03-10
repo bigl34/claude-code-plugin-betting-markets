@@ -3,7 +3,7 @@
 
 Search and aggregate betting/prediction markets from Polymarket, Kalshi, Manifold, Betfair, and 40+ bookmakers via The Odds API
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.5.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
@@ -19,6 +19,8 @@ Search and aggregate betting/prediction markets from Polymarket, Kalshi, Manifol
 - **current-orders** — List open Betfair orders
 - **cleared-orders** — List settled/voided Betfair orders
 - **account-summary** — Betfair account dashboard (balance + orders + P&L)
+- Chart Generation
+- **chart** — Generate historical probability chart
 
 ## Prerequisites
 
@@ -48,7 +50,17 @@ node scripts/dist/cli.js list-tools
    cd scripts && npm install
    ```
 
+## Configuration
+
+Copy `config.template.json` to `config.json` and fill in the required values:
+
+| Field | Placeholder |
+|-------|-------------|
+| `credentials_path` | `/path/to/your/credentials` |
+
 ## Available Commands
+
+### CLI Commands
 
 | Command             | Description                                        | Options                                                                                                                                     |
 | ------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -64,6 +76,12 @@ node scripts/dist/cli.js list-tools
 | `current-orders`    | List open Betfair orders                           | `--order-projection`, `--market-ids`, `--date-from`, `--date-to`, `--order-by`, `--sort-dir`, `--limit`, `--max-pages`                      |
 | `cleared-orders`    | List settled/voided Betfair orders                 | `--bet-status` (required), `--event-type-ids`, `--market-ids`, `--side`, `--date-from`, `--date-to`, `--group-by`, `--limit`, `--max-pages` |
 | `account-summary`   | Betfair account dashboard (balance + orders + P&L) |                                                                                                                                             |
+
+### Chart Generation
+
+| Command | Description                           | Options                                                                           |
+| ------- | ------------------------------------- | --------------------------------------------------------------------------------- |
+| `chart` | Generate historical probability chart | `--market` (required), `--platform`, `--output`, `--width`, `--height`, `--title` |
 
 ### Common Options
 

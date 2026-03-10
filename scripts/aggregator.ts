@@ -640,6 +640,11 @@ export class BettingMarketsAggregator {
         description: 'Betfair account dashboard (balance + orders + P&L)',
       },
       {
+        name: 'chart',
+        description: 'Generate historical probability chart (Polymarket, Kalshi)',
+        options: ['--market', '--platform', '--output', '--width', '--height', '--title'],
+      },
+      {
         name: 'list-tools',
         description: 'List available commands',
       },

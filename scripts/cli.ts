@@ -5,10 +5,13 @@
  * Zod-validated CLI for searching and aggregating prediction markets.
  */
 
+import { writeFileSync } from 'fs';
 import { z, createCommand, runCli, cliTypes } from "@local/cli-utils";
 import type { Platform, SearchOptions, BetStatus, OrderProjection, OrderBy, SortDir, Side, GroupBy } from "./types.js";
 import { BettingMarketsAggregator } from "./aggregator.js";
 import { formatGbpWithUsd } from "./utils.js";
+import { HistoricalDataFetcher } from './historical-data.js';
+import { ChartRenderer } from './chart-renderer.js';
 
 const PLATFORM_VALUES = ["polymarket", "betfair", "theodds", "kalshi", "manifold", "myriad"] as const;
 
@@ -309,6 +312,63 @@ const commands = {
       return result;
     },
     "List settled/voided Betfair orders"
+  ),
+
+  "chart": createCommand(
+    z.object({
+      market: z.string().min(1).describe("Market identifier (Polymarket slug/URL or Kalshi ticker)"),
+      platform: z.enum(["polymarket", "kalshi"]).optional().describe("Force platform"),
+      output: z.string().optional().describe("Output PNG path (default: /tmp/betting-chart-{ts}.png)"),
+      width: cliTypes.int(400, 3000).optional().describe("Width px (default 1400)"),
+      height: cliTypes.int(300, 2000).optional().describe("Height px (default 800)"),
+      title: z.string().optional().describe("Custom chart title"),
+    }),
+    async (args) => {
+      const { market, platform, output, width, height, title } = args as {
+        market: string;
+        platform?: 'polymarket' | 'kalshi';
+        output?: string;
+        width?: number;
+        height?: number;
+        title?: string;
+      };
+
+      const fetcher = new HistoricalDataFetcher();
+      const result = await fetcher.fetch(market, platform);
+
+      const renderer = new ChartRenderer();
+      const pngBuffer = renderer.render(result.series, {
+        width,
+        height,
+        title: title || result.title,
+      });
+
+      const outPath = output || `/tmp/betting-chart-${Date.now()}.png`;
+      writeFileSync(outPath, pngBuffer);
+
+      console.log(`Chart saved to: ${outPath}`);
+      if (result.warnings.length > 0) {
+        console.log(`Warnings: ${result.warnings.join('; ')}`);
+      }
+
+      return {
+        path: outPath,
+        title: result.title,
+        sourceUrl: result.sourceUrl,
+        seriesCount: result.series.length,
+        series: result.series.map(s => ({
+          label: s.label,
+          platform: s.platform,
+          pointCount: s.points.length,
+          timeRange: s.points.length > 0 ? {
+            from: new Date(s.points[0].timestamp).toISOString(),
+            to: new Date(s.points[s.points.length - 1].timestamp).toISOString(),
+          } : null,
+        })),
+        warnings: result.warnings,
+      };
+    },
+    "Generate historical probability chart (PNG)"
   ),
 
   "account-summary": createCommand(
