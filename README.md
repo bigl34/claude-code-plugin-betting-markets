@@ -31,7 +31,7 @@ Search and aggregate betting/prediction markets from Polymarket, Kalshi, Manifol
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/claude-code-plugin-betting-markets.git
+git clone https://github.com/bigl34/claude-code-plugin-betting-markets.git
 cd claude-code-plugin-betting-markets
 cp config.template.json config.json  # fill in your credentials
 cd scripts && npm install
