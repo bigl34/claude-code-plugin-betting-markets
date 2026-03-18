@@ -36,6 +36,7 @@ export interface UnifiedMarket {
 
   // Content
   question: string;
+  description?: string; // Resolution criteria / market description
   outcomes?: Outcome[];
 
   // Odds (always percentage)

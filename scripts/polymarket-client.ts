@@ -5,7 +5,7 @@
  * The gamma-api.polymarket.com doesn't support proper text search filters.
  */
 
-import type { UnifiedMarket, MarketClient, SearchOptions, PolymarketConfig } from './types.js';
+import type { UnifiedMarket, MarketClient, SearchOptions, PolymarketConfig, Outcome } from './types.js';
 import { polymarketOddsToPercent, usdcToUsd, nowISO } from './utils.js';
 
 // =============================================================================
@@ -41,9 +41,24 @@ interface PolymarketSearchMarket {
   volume: string;
   outcomePrices: string | string[]; // JSON string or array like ["0.22","0.78"]
   outcomes: string | string[]; // JSON string or array like ["Yes","No"]
+  clobTokenIds?: string | string[]; // JSON string or array — CLOB token IDs for order book
   active: boolean;
   closed: boolean;
   acceptingOrders: boolean;
+}
+
+// =============================================================================
+// Gamma API Types (for CLOB token ID lookup)
+// =============================================================================
+
+interface GammaMarket {
+  id: string;
+  question: string;
+  conditionId: string;
+  slug: string;
+  clobTokenIds?: string | string[]; // JSON string or array of token ID strings
+  outcomePrices?: string;
+  outcomes?: string;
 }
 
 interface NextDataSearchResponse {
@@ -130,20 +145,28 @@ export class PolymarketClient implements MarketClient {
       // Convert events to unified markets
       const markets: UnifiedMarket[] = [];
       for (const event of events) {
-        // Use event-level data if no individual markets
         if (!event.markets || event.markets.length === 0) {
+          // No sub-markets — use event-level data only
           markets.push(this.normalizeEventToMarket(event));
+        } else if (event.markets.length === 1) {
+          // Single sub-market — binary Yes/No
+          markets.push(this.normalizeMarketWithEvent(event.markets[0], event));
         } else {
-          // Use the first market's prices with event-level volume
-          const primaryMarket = event.markets[0];
-          markets.push(this.normalizeMarketWithEvent(primaryMarket, event));
+          // Multi-outcome event: each sub-market = one candidate/outcome
+          // e.g., "Next UK PM" has separate Yes/No markets per candidate
+          markets.push(this.normalizeMultiMarketEvent(event));
         }
       }
 
       // Sort by volume and limit
-      return markets
+      const sorted = markets
         .sort((a, b) => b.volume - a.volume)
         .slice(0, limit);
+
+      // Enrich with CLOB spread data (best-effort, non-blocking)
+      await this.enrichWithClobSpread(sorted);
+
+      return sorted;
     } catch (error) {
       console.error('Polymarket search error:', error);
       throw error;
@@ -185,11 +208,19 @@ export class PolymarketClient implements MarketClient {
 
       if (!event) return null;
 
-      if (event.markets && event.markets.length > 0) {
-        return this.normalizeMarketWithEvent(event.markets[0], event);
+      let market: UnifiedMarket;
+      if (!event.markets || event.markets.length === 0) {
+        market = this.normalizeEventToMarket(event);
+      } else if (event.markets.length === 1) {
+        market = this.normalizeMarketWithEvent(event.markets[0], event);
+      } else {
+        market = this.normalizeMultiMarketEvent(event);
       }
 
-      return this.normalizeEventToMarket(event);
+      // Enrich single market with spread data
+      await this.enrichWithClobSpread([market]);
+
+      return market;
     } catch (error) {
       console.error('Polymarket getMarket error:', error);
       throw error;
@@ -206,6 +237,7 @@ export class PolymarketClient implements MarketClient {
       eventId: event.id,
       url: `https://polymarket.com/event/${event.slug}`,
       question: event.title,
+      description: event.description || undefined,
       odds: 50, // Unknown without market data
       volume: event.volume || 0,
       liquidity: event.liquidity || 0,
@@ -253,6 +285,7 @@ export class PolymarketClient implements MarketClient {
       eventId: event.id,
       url: `https://polymarket.com/event/${event.slug}`,
       question: event.title || market.question,
+      description: event.description || undefined,
       outcomes,
       odds: primaryOdds,
       volume: usdcToUsd(volume),
@@ -261,5 +294,224 @@ export class PolymarketClient implements MarketClient {
       endDate: market.endDate || event.endDate,
       lastUpdated: nowISO(),
     };
+  }
+
+  /**
+   * Normalize a multi-outcome event where each sub-market = one candidate/outcome.
+   * e.g., "Next UK PM" has markets: "Angela Rayner?", "Ed Miliband?", etc.
+   * Each sub-market has Yes/No outcomes — we extract the "Yes" price as the candidate's probability.
+   */
+  private normalizeMultiMarketEvent(event: PolymarketSearchEvent): UnifiedMarket {
+    const outcomes: Outcome[] = [];
+
+    for (const market of event.markets) {
+      try {
+        const outcomeNames: string[] = Array.isArray(market.outcomes)
+          ? market.outcomes
+          : JSON.parse(market.outcomes || '[]');
+        const outcomePrices: (string | number)[] = Array.isArray(market.outcomePrices)
+          ? market.outcomePrices
+          : JSON.parse(market.outcomePrices || '[]');
+
+        // Find the "Yes" price — this is the probability of this candidate/outcome
+        const yesIndex = outcomeNames.findIndex(n => n.toLowerCase() === 'yes');
+        const yesPrice = yesIndex >= 0
+          ? parseFloat(String(outcomePrices[yesIndex])) || 0
+          : parseFloat(String(outcomePrices[0])) || 0;
+
+        // Extract CLOB token IDs if available (for spread enrichment later)
+        let clobTokenIds: string[] | undefined;
+        try {
+          clobTokenIds = Array.isArray(market.clobTokenIds)
+            ? market.clobTokenIds
+            : market.clobTokenIds ? JSON.parse(market.clobTokenIds) : undefined;
+        } catch { /* ignore */ }
+
+        // Use "Yes" token ID for spread lookup (first token = Yes outcome)
+        const yesTokenId = clobTokenIds?.[yesIndex >= 0 ? yesIndex : 0];
+
+        outcomes.push({
+          name: market.question,
+          odds: polymarketOddsToPercent(yesPrice),
+          // Only store actual CLOB token IDs (long hex strings), not conditionIds
+          source: yesTokenId || undefined,
+        });
+      } catch {
+        // Skip unparseable markets
+      }
+    }
+
+    // Sort by odds descending (favourite first)
+    outcomes.sort((a, b) => b.odds - a.odds);
+
+    const volume = event.volume || 0;
+    const liquidity = event.liquidity || 0;
+
+    return {
+      platform: 'polymarket',
+      id: event.id,
+      eventId: event.id,
+      url: `https://polymarket.com/event/${event.slug}`,
+      question: event.title,
+      description: event.description || undefined,
+      outcomes,
+      odds: outcomes[0]?.odds || 50,
+      volume: usdcToUsd(volume),
+      liquidity: usdcToUsd(liquidity),
+      status: event.closed ? 'closed' : event.active ? 'open' : 'unknown',
+      endDate: event.endDate,
+      lastUpdated: nowISO(),
+    };
+  }
+
+  // =============================================================================
+  // CLOB Spread Enrichment
+  // =============================================================================
+
+  /**
+   * Enrich market outcomes with buy/sell spread from Polymarket's CLOB /price endpoint.
+   *
+   * The /price endpoint returns real execution prices that factor in BOTH the AMM
+   * and CLOB order book — unlike /book which only shows the thin CLOB.
+   * This gives meaningful spreads (typically 0.2-2pp) even for AMM-backed markets.
+   *
+   * Token IDs come from search data (clobTokenIds) or Gamma API fallback.
+   */
+  private async enrichWithClobSpread(markets: UnifiedMarket[]): Promise<void> {
+    for (const market of markets) {
+      if (!market.outcomes || market.outcomes.length === 0) continue;
+
+      try {
+        // Check if outcomes already have CLOB token IDs stored in the source field
+        const hasTokenIds = market.outcomes.some(o =>
+          o.source && o.source !== 'polymarket' && o.source.length > 60
+        );
+
+        let tokenMap: Map<string, string> | undefined;
+
+        if (!hasTokenIds && market.url) {
+          // Fetch token IDs from Gamma API
+          tokenMap = await this.fetchGammaTokenIds(market.url);
+        }
+
+        // Fetch buy/sell prices in parallel (max 20 outcomes)
+        const outcomesToEnrich = market.outcomes.slice(0, 20);
+        const pricePromises = outcomesToEnrich.map(async (outcome) => {
+          let tokenId = outcome.source && outcome.source.length > 60
+            ? outcome.source
+            : undefined;
+
+          if (!tokenId && tokenMap) {
+            tokenId = tokenMap.get(outcome.name);
+          }
+
+          if (!tokenId) return;
+
+          try {
+            const [buyPrice, sellPrice] = await this.fetchClobPrices(tokenId);
+            if (buyPrice !== null && sellPrice !== null) {
+              const spreadPP = Math.round(Math.abs(buyPrice - sellPrice) * 100 * 100) / 100;
+
+              outcome.layOdds = polymarketOddsToPercent(buyPrice);   // cost to buy (ask)
+              outcome.backOdds = polymarketOddsToPercent(sellPrice);  // proceeds from sell (bid)
+              outcome.spread = spreadPP;
+              // Use midpoint of execution prices as odds
+              outcome.odds = Math.round(((buyPrice + sellPrice) / 2) * 100 * 100) / 100;
+            }
+          } catch {
+            // Price fetch failed for this outcome — skip silently
+          }
+        });
+
+        await Promise.all(pricePromises);
+
+        // Clean up: set source to platform name (token IDs were only used for lookup)
+        for (const outcome of market.outcomes) {
+          outcome.source = 'polymarket';
+        }
+      } catch {
+        // Non-critical: spread enrichment failed, continue without it
+      }
+    }
+  }
+
+  /**
+   * Fetch execution prices (buy + sell) for a token from the CLOB /price endpoint.
+   * This factors in both AMM and CLOB liquidity for realistic execution prices.
+   * Returns [buyPrice, sellPrice] as 0-1 decimals, or [null, null] on failure.
+   */
+  private async fetchClobPrices(tokenId: string): Promise<[number | null, number | null]> {
+    try {
+      const [buyResp, sellResp] = await Promise.all([
+        fetch(`https://clob.polymarket.com/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`, {
+          headers: { 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        }),
+        fetch(`https://clob.polymarket.com/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`, {
+          headers: { 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        }),
+      ]);
+
+      if (!buyResp.ok || !sellResp.ok) return [null, null];
+
+      const buyData = await buyResp.json() as { price?: string };
+      const sellData = await sellResp.json() as { price?: string };
+
+      const buyPrice = buyData.price ? parseFloat(buyData.price) : null;
+      const sellPrice = sellData.price ? parseFloat(sellData.price) : null;
+
+      return [buyPrice, sellPrice];
+    } catch {
+      return [null, null];
+    }
+  }
+
+  /**
+   * Fetch CLOB token IDs from Gamma API for all markets in an event.
+   * Returns a map of question → Yes token ID.
+   */
+  private async fetchGammaTokenIds(eventUrl: string): Promise<Map<string, string>> {
+    const tokenMap = new Map<string, string>();
+
+    try {
+      // Extract slug from event URL
+      const slugMatch = eventUrl.match(/\/event\/([^/?#]+)/);
+      if (!slugMatch) return tokenMap;
+
+      const slug = slugMatch[1];
+      const response = await fetch(
+        `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`,
+        {
+          headers: { 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+
+      if (!response.ok) return tokenMap;
+
+      const events = await response.json() as Array<{ markets?: GammaMarket[] }>;
+      const event = events[0];
+      if (!event?.markets) return tokenMap;
+
+      for (const market of event.markets) {
+        if (market.clobTokenIds) {
+          try {
+            // clobTokenIds may be a JSON string or array
+            const tokenIds: string[] = Array.isArray(market.clobTokenIds)
+              ? market.clobTokenIds
+              : JSON.parse(market.clobTokenIds);
+            if (tokenIds.length > 0) {
+              // First token ID = Yes outcome
+              tokenMap.set(market.question, tokenIds[0]);
+            }
+          } catch { /* ignore parse errors */ }
+        }
+      }
+    } catch {
+      // Gamma API failed — return empty map
+    }
+
+    return tokenMap;
   }
 }

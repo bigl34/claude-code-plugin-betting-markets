@@ -95,9 +95,10 @@ export class BettingMarketsAggregator {
 
     const targetPlatform = options.platform;
 
-    // Determine if FinFeedAPI handles Polymarket (for dedup)
-    const finfeedHandlesPolymarket = this.finfeed?.isEnabled() &&
-      this.finfeed.handlesExchange('polymarket');
+    // Native scraper is always preferred for Polymarket (has real server-side
+    // search via polymarket.com). FinFeedAPI's client-side filtering of 200
+    // rows misses most markets — especially political/niche ones.
+    const finfeedHandlesPolymarket = false;
 
     // Build search promises
     type SearchResult = {
@@ -279,17 +280,17 @@ export class BettingMarketsAggregator {
   private getFinfeedTargetExchanges(targetPlatform?: Platform): string[] {
     if (!this.finfeed?.isEnabled()) return [];
 
-    const allExchanges = ['polymarket', 'kalshi', 'manifold', 'myriad'];
+    // Polymarket excluded — native scraper has real server-side search
+    const allExchanges = ['kalshi', 'manifold', 'myriad'];
 
     if (targetPlatform) {
-      // If targeting a specific platform that FinFeedAPI handles, query just that
+      if (targetPlatform === 'polymarket') return []; // Native scraper handles this
       if (this.finfeed.handlesExchange(targetPlatform)) {
         return [targetPlatform];
       }
-      return []; // Target platform not handled by FinFeedAPI
+      return [];
     }
 
-    // No target — return all exchanges that FinFeedAPI handles
     return allExchanges.filter(e => this.finfeed!.handlesExchange(e));
   }
 

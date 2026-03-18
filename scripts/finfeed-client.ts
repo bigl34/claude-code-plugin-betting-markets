@@ -26,6 +26,9 @@ import type {
   Outcome,
 } from './types.js';
 import { polymarketOddsToPercent, nowISO } from './utils.js';
+import { PluginCache } from '@local/plugin-cache';
+
+const CACHE_TTL_MARKETS = 30 * 60 * 1000; // 30 minutes for market listings
 
 // =============================================================================
 // FinFeedAPI Response Types (from OpenAPI spec)
@@ -77,6 +80,7 @@ export class FinFeedClient implements MarketClient {
   private exchanges: string[];  // UPPERCASE exchange IDs
   private enabled: boolean;
   private lastError: string | null = null;
+  private cache: PluginCache;
 
   constructor(config: FinFeedConfig) {
     this.apiKey = config.apiKey || '';
@@ -85,6 +89,10 @@ export class FinFeedClient implements MarketClient {
     this.exchanges = (config.exchanges || ['polymarket', 'kalshi', 'manifold', 'myriad'])
       .map(e => PLATFORM_TO_EXCHANGE[e] || e.toUpperCase());
     this.enabled = config.enabled !== false && !!config.apiKey;
+    this.cache = new PluginCache({
+      namespace: 'betting-markets-finfeed',
+      defaultTTL: CACHE_TTL_MARKETS,
+    });
   }
 
   isEnabled(): boolean {
@@ -172,19 +180,11 @@ export class FinFeedClient implements MarketClient {
 
     const allMarkets: UnifiedMarket[] = [];
 
-    // Query exchanges sequentially with delay to respect rate limits (free tier)
+    // Query exchanges — use cached listings when available to avoid rate limit delays
     for (let i = 0; i < targetExchanges.length; i++) {
       const exchangeId = targetExchanges[i];
-      // Delay between requests to respect rate limit (free tier: ~1 req/15s)
-      if (i > 0) await new Promise(r => setTimeout(r, 16000));
       try {
-        const rows = await this.apiGet<FinFeedMarketRow[]>(
-          `/v1/markets/${exchangeId}/history`,
-          {
-            limit: '200',   // Fetch a decent batch for client-side filtering
-            page: '1',
-          }
-        );
+        const rows = await this.getExchangeMarkets(exchangeId, i > 0);
 
         // Filter by query text
         const matchingRows = rows.filter(row => {
@@ -218,6 +218,48 @@ export class FinFeedClient implements MarketClient {
     if (!this.exchanges.includes(upperId)) return [];
 
     return this.search(query, { ...options, platform: exchange as Platform });
+  }
+
+  // ============================================
+  // CACHED EXCHANGE LISTINGS
+  // ============================================
+
+  /**
+   * Get market listings for an exchange, using cache to avoid rate limit delays.
+   * Cache TTL: 30 minutes. On cache miss, fetches 3 pages (600 rows) from API.
+   * Multi-page fetch is slow on cold cache (~32s per exchange due to rate limits)
+   * but instant on subsequent searches within the cache window.
+   */
+  private async getExchangeMarkets(exchangeId: string, needsDelay: boolean): Promise<FinFeedMarketRow[]> {
+    const cacheKey = `markets_${exchangeId}`;
+    const cached = this.cache.get<FinFeedMarketRow[]>(cacheKey, { ttl: CACHE_TTL_MARKETS });
+
+    if (cached.hit && !cached.stale) {
+      return cached.data!;
+    }
+
+    const allRows: FinFeedMarketRow[] = [];
+    const pagesToFetch = 3;
+
+    for (let page = 1; page <= pagesToFetch; page++) {
+      // Rate limit delay between API requests (free tier: ~1 req/15s)
+      if (needsDelay || page > 1) {
+        await new Promise(r => setTimeout(r, 16000));
+      }
+
+      const rows = await this.apiGet<FinFeedMarketRow[]>(
+        `/v1/markets/${exchangeId}/history`,
+        { limit: '200', page: String(page) }
+      );
+
+      allRows.push(...rows);
+
+      // Stop early if we got fewer than 200 — no more pages
+      if (rows.length < 200) break;
+    }
+
+    await this.cache.set(cacheKey, allRows, { ttl: CACHE_TTL_MARKETS });
+    return allRows;
   }
 
   // ============================================

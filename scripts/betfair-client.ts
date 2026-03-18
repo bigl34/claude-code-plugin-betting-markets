@@ -29,6 +29,13 @@ interface BetfairLoginResponse {
   loginStatus: string;
 }
 
+interface BetfairMarketDescription {
+  rules?: string;
+  marketType?: string;
+  turnInPlayEnabled?: boolean;
+  settleTime?: string;
+}
+
 interface BetfairMarketCatalogue {
   marketId: string;
   marketName: string;
@@ -47,6 +54,7 @@ interface BetfairMarketCatalogue {
     id: string;
     name: string;
   };
+  description?: BetfairMarketDescription;
 }
 
 interface BetfairRunner {
@@ -389,7 +397,7 @@ export class BetfairClient implements MarketClient {
         body: JSON.stringify({
           filter,
           maxResults: maxResults,
-          marketProjection: ['EVENT', 'EVENT_TYPE', 'COMPETITION', 'RUNNER_DESCRIPTION'],
+          marketProjection: ['EVENT', 'EVENT_TYPE', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
         }),
       });
 
@@ -463,7 +471,7 @@ export class BetfairClient implements MarketClient {
         body: JSON.stringify({
           filter: { marketIds: [marketId] },
           maxResults: 1,
-          marketProjection: ['EVENT', 'EVENT_TYPE', 'RUNNER_DESCRIPTION'],
+          marketProjection: ['EVENT', 'EVENT_TYPE', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
         }),
       });
 
@@ -722,6 +730,20 @@ export class BetfairClient implements MarketClient {
     const marketName = catalogue.marketName || '';
     const question = eventName ? `${eventName} - ${marketName}` : marketName;
 
+    // Strip HTML from Betfair rules: convert block tags to spaces, strip tags, decode entities
+    const rawRules = catalogue.description?.rules;
+    const description = rawRules
+      ? rawRules
+          .replace(/<br\s*\/?>/gi, ' ')
+          .replace(/<\/(?:p|div|li|tr)>/gi, ' ')
+          .replace(/<[^>]*>/g, '')
+          .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+          .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          .replace(/\s+/g, ' ')
+          .trim()
+          .substring(0, 500)
+      : undefined;
+
     // Get primary odds from midpoint of back/lay prices (or back-only if one-sided)
     let primaryOdds = 0;
     let outcomes: Outcome[] | undefined;
@@ -786,7 +808,7 @@ export class BetfairClient implements MarketClient {
       primaryOdds = outcomes[0]?.odds || 0;
     }
 
-    // Volume is in GBP, convert to USD
+    // Volume in GBP (Betfair native currency), convert to USD for unified sorting
     const volumeGBP = book?.totalMatched || catalogue.totalMatched || 0;
     const volumeUSD = gbpToUsd(volumeGBP, this.gbpToUsdRate);
 
@@ -805,6 +827,7 @@ export class BetfairClient implements MarketClient {
       eventId: catalogue.event?.id,
       url: `https://www.betfair.com/exchange/plus/market/${catalogue.marketId}`,
       question,
+      description,
       outcomes,
       odds: primaryOdds,
       volume: volumeUSD,
