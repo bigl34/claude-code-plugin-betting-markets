@@ -1,5 +1,6 @@
 {
   "name": "betting-markets-manager",
-  "version": "1.8.0",
-  "description": "Search and aggregate betting/prediction markets from Polymarket, Kalshi, Manifold, Betfair, and 40+ bookmakers via The Odds API"
+  "version": "1.9.0",
+  "description": "Search and aggregate betting and prediction markets from Polymarket, Kalshi, Manifold, Myriad, Betfair, and bookmakers via The Odds API",
+  "repository": "https://github.com/bigl34/claude-code-plugin-betting-markets"
 }

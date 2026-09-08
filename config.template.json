@@ -1,4 +1,38 @@
 {
-  "_comment": "Copy this to config.json and fill in your values",
-  "credentials_path": "/path/to/your/credentials"
+  "polymarket": {
+    "baseUrl": "https://gamma-api.polymarket.com",
+    "enabled": true
+  },
+  "betfair": {
+    "ssoUrl": "https://identitysso.betfair.com/api/login",
+    "certSsoUrl": "https://identitysso-cert.betfair.com/api/certlogin",
+    "baseUrl": "https://api.betfair.com/exchange/betting/json-rpc/v1",
+    "accountBaseUrl": "https://api.betfair.com/exchange/account/json-rpc/v1",
+    "appKey": "<BETFAIR_APP_KEY>",
+    "username": "<BETFAIR_USERNAME>",
+    "password": "<BETFAIR_PASSWORD>",
+    "certPath": "<RAM_PATH_TO_BETFAIR_CERTIFICATE>",
+    "keyPath": "<RAM_PATH_TO_BETFAIR_PRIVATE_KEY>",
+    "enabled": true
+  },
+  "theodds": {
+    "apiKey": "<THE_ODDS_API_KEY>",
+    "enabled": true,
+    "baseUrl": "https://api.the-odds-api.com",
+    "region": "uk",
+    "defaultMarket": "h2h",
+    "monthlyBudget": 400
+  },
+  "finfeed": {
+    "apiKey": "<FINFEED_API_KEY>",
+    "enabled": true,
+    "baseUrl": "https://api.finfeedapi.com",
+    "exchanges": ["kalshi", "manifold", "myriad"]
+  },
+  "settings": {
+    "gbpToUsd": 1.27,
+    "defaultMaxResults": 50,
+    "cacheMarketsTTL": 300,
+    "cacheMetadataTTL": 3600
+  }
 }

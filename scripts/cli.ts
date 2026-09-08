@@ -6,10 +6,10 @@
  */
 
 import { writeFileSync } from 'fs';
-import { z, createCommand, runCli, cliTypes } from "@local/cli-utils";
+import { z } from "zod";
+import { createCommand, runCli, cliTypes } from "./cli-support/validator.js";
 import type { Platform, SearchOptions, BetStatus, OrderProjection, OrderBy, SortDir, Side, GroupBy } from "./types.js";
 import { BettingMarketsAggregator } from "./aggregator.js";
-import { formatGbpWithUsd } from "./utils.js";
 import { HistoricalDataFetcher } from './historical-data.js';
 import { ChartRenderer } from './chart-renderer.js';
 
@@ -19,8 +19,9 @@ const PLATFORM_VALUES = ["polymarket", "betfair", "theodds", "kalshi", "manifold
 const commands = {
   "list-tools": createCommand(
     z.object({}),
-    async (_args, client: BettingMarketsAggregator) => client.listTools(),
-    "List all available commands"
+    async () => BettingMarketsAggregator.listTools(),
+    "List all available commands",
+    { sideEffect: "read", clientless: true }
   ),
 
   "search": createCommand(
@@ -43,7 +44,8 @@ const commands = {
       };
       return client.searchAll(query, { platform, minVolume, maxResults, sortBy, sportKey: sport });
     },
-    "Search markets across platforms"
+    "Search markets across platforms",
+    { sideEffect: "read" }
   ),
 
   "format-table": createCommand(
@@ -67,7 +69,8 @@ const commands = {
       console.log(table);
       process.exit(0);
     },
-    "Search and output markdown table"
+    "Search and output markdown table",
+    { sideEffect: "read" }
   ),
 
   "market": createCommand(
@@ -80,7 +83,8 @@ const commands = {
       const market = await client.getMarket(id, platform);
       return market || { found: false, message: "Market not found" };
     },
-    "Get single market details"
+    "Get single market details",
+    { sideEffect: "read" }
   ),
 
   "auth-test": createCommand(
@@ -103,12 +107,18 @@ const commands = {
       console.log("\nJSON:");
       return authResults;
     },
-    "Test authentication for all platforms"
+    "Test authentication for all platforms",
+    { sideEffect: "read" }
   ),
 
   "credit-status": createCommand(
-    z.object({}),
-    async (_args, client: BettingMarketsAggregator) => {
+    z.object({
+      refresh: z.boolean().optional().describe("Refresh account-wide usage through the free sports endpoint"),
+    }),
+    async (args, client: BettingMarketsAggregator) => {
+      if ((args as { refresh?: boolean }).refresh) {
+        await client.refreshCreditStatus();
+      }
       const formatted = client.getFormattedCreditStatus();
       console.log(formatted);
       const status = client.getCreditStatus();
@@ -118,7 +128,8 @@ const commands = {
       }
       return { message: "The Odds API is not enabled" };
     },
-    "Show The Odds API credit usage"
+    "Show The Odds API credit usage",
+    { sideEffect: "read" }
   ),
 
   "list-sports": createCommand(
@@ -140,7 +151,8 @@ const commands = {
       console.log("\nJSON:");
       return sports;
     },
-    "List available The Odds API sports (0 credits)"
+    "List available The Odds API sports (0 credits)",
+    { sideEffect: "read" }
   ),
 
   // ── Betfair Account Commands ──────────────────────────────────
@@ -161,7 +173,8 @@ const commands = {
       console.log("\nJSON:");
       return funds;
     },
-    "Show Betfair account balance and exposure"
+    "Show Betfair account balance and exposure",
+    { sideEffect: "read" }
   ),
 
   "account-statement": createCommand(
@@ -201,7 +214,8 @@ const commands = {
       console.log("\nJSON:");
       return result;
     },
-    "Show Betfair account transaction history"
+    "Show Betfair account transaction history",
+    { sideEffect: "read" }
   ),
 
   "current-orders": createCommand(
@@ -249,7 +263,8 @@ const commands = {
       console.log("\nJSON:");
       return result;
     },
-    "List open Betfair orders"
+    "List open Betfair orders",
+    { sideEffect: "read" }
   ),
 
   "cleared-orders": createCommand(
@@ -302,7 +317,7 @@ const commands = {
           console.log(`  ${sideStr} ${desc.substring(0, 35).padEnd(36)} ${runner.substring(0, 20).padEnd(21)} ${profitStr.padStart(12)}  comm:\u00a3${commission.toFixed(2)}  ${order.betOutcome?.padEnd(5) || ''}  ${date}`);
         }
         console.log("\u2500".repeat(110));
-        console.log(`  Total P&L: ${formatGbpWithUsd(totalProfit, 1.27)}  |  Total Commission: ${formatGbpWithUsd(totalCommission, 1.27)}`);
+        console.log(`  Total P&L: ${client.formatGbp(totalProfit)}  |  Total Commission: ${client.formatGbp(totalCommission)}`);
       }
       if (result.moreAvailable) {
         console.log(`\n  ... more available (use --max-pages to fetch more)`);
@@ -311,7 +326,8 @@ const commands = {
       console.log("\nJSON:");
       return result;
     },
-    "List settled/voided Betfair orders"
+    "List settled/voided Betfair orders",
+    { sideEffect: "read" }
   ),
 
   "chart": createCommand(
@@ -368,7 +384,8 @@ const commands = {
         warnings: result.warnings,
       };
     },
-    "Generate historical probability chart (PNG)"
+    "Generate historical probability chart (PNG)",
+    { sideEffect: "write" }
   ),
 
   "account-summary": createCommand(
@@ -411,7 +428,8 @@ const commands = {
       console.log("\nJSON:");
       return summary;
     },
-    "Betfair account dashboard (balance + orders + P&L)"
+    "Betfair account dashboard (balance + orders + P&L)",
+    { sideEffect: "read" }
   ),
 };
 

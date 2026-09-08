@@ -21,10 +21,11 @@ import type {
   Outcome,
   CreditStatus,
 } from './types.js';
-import { decimalOddsToPercent, trimmedMeanProbability, nowISO } from './utils.js';
+import { trimmedMeanProbability, nowISO } from './utils.js';
 import { findSportKeys } from './sport-aliases.js';
 import { CreditTracker } from './credit-tracker.js';
-import { PluginCache } from '@local/plugin-cache';
+import { PluginCache } from './cache-support/cache.js';
+import { fetchWithRetry } from './retry.js';
 
 // =============================================================================
 // The Odds API Response Types
@@ -73,6 +74,7 @@ interface OddsEvent {
 
 const CACHE_TTL_ODDS = 5 * 60 * 1000;     // 5 minutes for odds
 const CACHE_TTL_SPORTS = 24 * 60 * 60 * 1000; // 24 hours for sports list
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export class TheOddsClient implements MarketClient {
   private apiKey: string;
@@ -83,6 +85,7 @@ export class TheOddsClient implements MarketClient {
   private lastError: string | null = null;
   private creditTracker: CreditTracker;
   private cache: PluginCache;
+  private paidRequestQueue: Promise<void> = Promise.resolve();
 
   constructor(config: TheOddsConfig) {
     this.apiKey = config.apiKey || '';
@@ -116,23 +119,42 @@ export class TheOddsClient implements MarketClient {
   private async apiGet<T>(
     path: string,
     params: Record<string, string> = {},
-    options: { cacheTTL?: number; cacheKey?: string; creditCost?: number } = {}
+    options: {
+      cacheTTL?: number;
+      cacheKey?: string;
+      creditCost?: number;
+      bypassCache?: boolean;
+      preflighted?: boolean;
+      requireUsageHeader?: boolean;
+    } = {}
   ): Promise<T> {
-    const { cacheTTL, cacheKey, creditCost = 1 } = options;
+    const {
+      cacheTTL,
+      cacheKey,
+      creditCost = 1,
+      bypassCache = false,
+      preflighted = false,
+      requireUsageHeader = false,
+    } = options;
 
     // Check cache first
-    if (cacheKey) {
+    if (cacheKey && !bypassCache) {
       const cached = this.cache.get<T>(cacheKey, { ttl: cacheTTL });
       if (cached.hit && !cached.stale) {
         return cached.data!;
       }
     }
 
-    // Credit check (sports list is free = 0 credits)
-    if (creditCost > 0 && !this.creditTracker.canMakeRequest(creditCost)) {
-      const status = this.creditTracker.getCreditStatus();
-      this.lastError = `Credit budget exhausted: ${status.used}/${status.budget} used (${status.percentUsed}%)`;
-      throw new Error(this.lastError);
+    if (creditCost > 0 && !preflighted) {
+      return this.enqueuePaidRequest(async () => {
+        await this.refreshLiveUsage();
+        if (!this.creditTracker.canMakeRequest(creditCost)) {
+          const status = this.creditTracker.getCreditStatus();
+          this.lastError = `Credit budget exhausted: ${status.used}/${status.budget} used (${status.percentUsed}%)`;
+          throw new Error(this.lastError);
+        }
+        return this.apiGet<T>(path, params, { ...options, preflighted: true });
+      });
     }
 
     // Build URL
@@ -148,10 +170,18 @@ export class TheOddsClient implements MarketClient {
     }
 
     try {
-      const response = await fetch(url.toString());
+      const response = await fetchWithRetry(
+        url.toString(),
+        {},
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "TheOdds.request"
+      );
 
       // Update credit tracker from headers
-      this.creditTracker.updateFromHeaders(response.headers);
+      const usageConfirmed = this.creditTracker.updateFromHeaders(response.headers);
+      if (requireUsageHeader && !usageConfirmed) {
+        throw new Error('The Odds API live-usage preflight returned no valid x-requests-used header; paid request blocked');
+      }
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -174,6 +204,20 @@ export class TheOddsClient implements MarketClient {
       this.lastError = `The Odds API request failed: ${error instanceof Error ? error.message : String(error)}`;
       throw new Error(this.lastError);
     }
+  }
+
+  private enqueuePaidRequest<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.paidRequestQueue.then(operation, operation);
+    this.paidRequestQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async refreshLiveUsage(): Promise<void> {
+    await this.apiGet<OddsSport[]>('/v4/sports', {}, {
+      creditCost: 0,
+      bypassCache: true,
+      requireUsageHeader: true,
+    });
   }
 
   // ============================================
@@ -248,7 +292,7 @@ export class TheOddsClient implements MarketClient {
         }
       } catch (error) {
         // Log but don't fail the entire search for one sport
-        console.error(`TheOdds search error for ${sportKey}:`, error);
+        console.error("TheOdds search error for", sportKey, ":", error);
       }
     });
 
@@ -263,7 +307,7 @@ export class TheOddsClient implements MarketClient {
   // MARKET DETAILS
   // ============================================
 
-  async getMarket(id: string): Promise<UnifiedMarket | null> {
+  async getMarket(_id: string): Promise<UnifiedMarket | null> {
     if (!this.enabled) return null;
 
     // The Odds API doesn't have a direct "get by event ID" endpoint.
@@ -327,6 +371,11 @@ export class TheOddsClient implements MarketClient {
 
   getFormattedCreditStatus(): string {
     return this.creditTracker.getFormattedStatus();
+  }
+
+  async refreshCreditStatus(): Promise<CreditStatus> {
+    await this.refreshLiveUsage();
+    return this.getCreditStatus();
   }
 
   // ============================================

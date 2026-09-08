@@ -1,0 +1,4 @@
+interface:
+  display_name: "Betting Markets"
+  short_description: "Search live betting and prediction markets"
+  default_prompt: "Use $betting-markets to find current market odds and return compact source-labelled tables."

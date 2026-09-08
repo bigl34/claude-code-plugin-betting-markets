@@ -8,8 +8,8 @@
  * Storage: ~/.cache/plugin-cache/betting-markets-manager/theodds-credits.json
  */
 
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { join } from 'path';
 import { homedir } from 'os';
 import type { CreditStatus } from './types.js';
 
@@ -30,6 +30,14 @@ interface CreditState {
   monthStart: string;       // YYYY-MM format for detecting month rollover
   monthlyBudget: number;
   requestLog: RequestLogEntry[];
+  liveUsageConfirmed: boolean;
+}
+
+function parseCreditHeader(value: string | null): number | undefined {
+  if (value === null || value.trim() === '') return undefined;
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 // =============================================================================
@@ -47,6 +55,8 @@ export class CreditTracker {
   constructor(monthlyBudget: number = 400) {
     this.budget = monthlyBudget;
     this.state = this.loadState();
+    this.state.liveUsageConfirmed ??= false;
+    this.state.monthlyBudget = monthlyBudget;
     this.checkMonthReset();
   }
 
@@ -76,6 +86,7 @@ export class CreditTracker {
       monthStart: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`,
       monthlyBudget: this.budget,
       requestLog: [],
+      liveUsageConfirmed: false,
     };
   }
 
@@ -94,7 +105,6 @@ export class CreditTracker {
       // Clean up temp file on error
       try {
         if (existsSync(tmpFile)) {
-          const { unlinkSync } = require('fs');
           unlinkSync(tmpFile);
         }
       } catch {
@@ -126,30 +136,14 @@ export class CreditTracker {
    * Check if we have enough credits for a request.
    * Returns true if the request should proceed.
    *
-   * Uses a staleness check: if the last header update was >1h ago,
-   * allows the request even if state says exhausted (stale data
-   * shouldn't permanently trip the breaker).
+   * This is evaluated only after a free live-usage preflight. The configured
+   * budget is intentionally independent of the provider account's allowance.
    */
   canMakeRequest(estimatedCost: number = 1): boolean {
     this.checkMonthReset();
 
-    // If we have credits remaining, allow
-    if (this.state.creditsRemaining >= estimatedCost) {
-      return true;
-    }
-
-    // Circuit breaker check: is our data stale?
-    const lastUpdate = new Date(this.state.lastUpdated);
-    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
-
-    // If last update is stale (>1h), allow the request —
-    // our remaining count might be wrong
-    if (lastUpdate < hourAgo) {
-      return true;
-    }
-
-    // Hard exhausted: recent confirmation from API headers
-    return false;
+    return this.state.liveUsageConfirmed === true &&
+      this.state.creditsUsed + estimatedCost <= this.budget;
   }
 
   /**
@@ -179,19 +173,23 @@ export class CreditTracker {
    * Update credit counts from The Odds API response headers.
    * The API returns x-requests-remaining and x-requests-used headers.
    */
-  updateFromHeaders(headers: Headers): void {
-    const remaining = headers.get('x-requests-remaining');
-    const used = headers.get('x-requests-used');
+  updateFromHeaders(headers: Headers): boolean {
+    const remaining = parseCreditHeader(headers.get('x-requests-remaining'));
+    const used = parseCreditHeader(headers.get('x-requests-used'));
 
-    if (remaining !== null) {
-      this.state.creditsRemaining = parseInt(remaining, 10);
+    if (remaining !== undefined) {
+      this.state.creditsRemaining = remaining;
     }
-    if (used !== null) {
-      this.state.creditsUsed = parseInt(used, 10);
+    if (used !== undefined) {
+      this.state.creditsUsed = used;
+      this.state.liveUsageConfirmed = true;
     }
 
-    this.state.lastUpdated = new Date().toISOString();
-    this.saveState();
+    if (remaining !== undefined || used !== undefined) {
+      this.state.lastUpdated = new Date().toISOString();
+      this.saveState();
+    }
+    return used !== undefined;
   }
 
   // ============================================
@@ -235,7 +233,10 @@ export class CreditTracker {
 
   private progressBar(percent: number): string {
     const width = 20;
-    const filled = Math.round((percent / 100) * width);
+    const barPercent = Number.isFinite(percent)
+      ? Math.min(100, Math.max(0, percent))
+      : 0;
+    const filled = Math.round((barPercent / 100) * width);
     const empty = width - filled;
     return `[${'█'.repeat(filled)}${'░'.repeat(empty)}]`;
   }

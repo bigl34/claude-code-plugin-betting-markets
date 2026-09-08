@@ -5,6 +5,10 @@
  * for chart generation. Self-contained types (no types.ts dependency).
  */
 
+import { fetchWithRetry } from './retry.js';
+
+const REQUEST_TIMEOUT_MS = 30_000;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -68,6 +72,28 @@ export function parseIdentifier(input: string): ParsedIdentifier {
   return { platform: 'polymarket', id: input };
 }
 
+export function resolveHistoricalIdentifier(
+  input: string,
+  forcePlatform?: 'polymarket' | 'kalshi',
+): ParsedIdentifier {
+  const parsed = parseIdentifier(input);
+
+  if (!forcePlatform) return parsed;
+
+  const urlPlatform = /polymarket\.com\/event\/[a-z0-9-]+/i.test(input)
+    ? 'polymarket'
+    : /kalshi\.com\/markets?\/(?:[A-Z0-9-]+\/)?[A-Z0-9-]+/i.test(input)
+      ? 'kalshi'
+      : undefined;
+
+  if (urlPlatform && urlPlatform !== forcePlatform) {
+    const urlPlatformName = urlPlatform === 'polymarket' ? 'Polymarket' : 'Kalshi';
+    throw new Error(`Cannot force platform "${forcePlatform}" for a ${urlPlatformName} URL`);
+  }
+
+  return { ...parsed, platform: forcePlatform };
+}
+
 // =============================================================================
 // Downsampling
 // =============================================================================
@@ -99,9 +125,7 @@ export class HistoricalDataFetcher {
    * Auto-detects platform from the identifier format.
    */
   async fetch(identifier: string, forcePlatform?: 'polymarket' | 'kalshi'): Promise<HistoricalFetchResult> {
-    const parsed = forcePlatform
-      ? { platform: forcePlatform, id: identifier }
-      : parseIdentifier(identifier);
+    const parsed = resolveHistoricalIdentifier(identifier, forcePlatform);
 
     switch (parsed.platform) {
       case 'polymarket':
@@ -120,7 +144,12 @@ export class HistoricalDataFetcher {
 
     // Step 1: Get event data from Gamma API
     const gammaUrl = `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`;
-    const gammaResp = await fetch(gammaUrl);
+    const gammaResp = await fetchWithRetry(
+      gammaUrl,
+      {},
+      { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+      "Polymarket.gammaEvents.history"
+    );
     if (!gammaResp.ok) {
       throw new Error(`Gamma API returned ${gammaResp.status}: ${await gammaResp.text().catch(() => 'unknown')}`);
     }
@@ -172,7 +201,12 @@ export class HistoricalDataFetcher {
 
       try {
         const historyUrl = `https://clob.polymarket.com/prices-history?market=${yesTokenId}&interval=max&fidelity=60`;
-        const histResp = await fetch(historyUrl);
+        const histResp = await fetchWithRetry(
+          historyUrl,
+          {},
+          { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+          "Polymarket.pricesHistory"
+        );
         if (!histResp.ok) {
           warnings.push(`Price history failed for "${market.question}": HTTP ${histResp.status}`);
           continue;
@@ -226,7 +260,12 @@ export class HistoricalDataFetcher {
 
     // Try to get market info for the title
     try {
-      const marketResp = await fetch(`${baseUrl}/markets/${ticker}`);
+      const marketResp = await fetchWithRetry(
+        `${baseUrl}/markets/${ticker}`,
+        {},
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Kalshi.marketInfo"
+      );
       if (marketResp.ok) {
         const marketInfo = await marketResp.json() as { market: { title?: string; subtitle?: string; series_ticker?: string } };
         marketTitle = marketInfo.market.title || marketInfo.market.subtitle || ticker;
@@ -238,7 +277,12 @@ export class HistoricalDataFetcher {
     // Try active candlesticks
     try {
       const candleUrl = `${baseUrl}/markets/${ticker}/candlesticks?period_interval=60`;
-      const resp = await fetch(candleUrl);
+      const resp = await fetchWithRetry(
+        candleUrl,
+        {},
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Kalshi.candlesticks"
+      );
       if (resp.ok) {
         const data = await resp.json() as { candlesticks: KalshiCandle[] };
         candleData = data.candlesticks || [];
@@ -251,7 +295,12 @@ export class HistoricalDataFetcher {
     if (candleData.length === 0) {
       try {
         const histUrl = `${baseUrl}/markets/${ticker}/candlesticks?period_interval=60`;
-        const resp = await fetch(histUrl);
+        const resp = await fetchWithRetry(
+          histUrl,
+          {},
+          { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+          "Kalshi.candlesticks.fallback"
+        );
         if (resp.ok) {
           const data = await resp.json() as { candlesticks: KalshiCandle[] };
           candleData = data.candlesticks || [];

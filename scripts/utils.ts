@@ -142,11 +142,13 @@ export function formatMarkdownTable(
   }
 
   const headers = ['Platform', 'Question', 'Odds', 'Volume'];
+  if (options.includeUrl) headers.push('URL');
   const rows = markets.map(m => [
     `**${capitalize(m.platform)}**`,
     m.question,
     `**${formatOdds(m.odds)}**`,
     formatVolume(m.volume),
+    ...(options.includeUrl ? [m.url] : []),
   ]);
 
   // Calculate column widths

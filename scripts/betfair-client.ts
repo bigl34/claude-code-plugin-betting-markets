@@ -19,6 +19,9 @@ import type {
 import { betfairOddsToPercent, gbpToUsd, nowISO } from './utils.js';
 import { readFileSync } from 'fs';
 import https from 'https';
+import { fetchWithRetry } from './retry.js';
+
+const REQUEST_TIMEOUT_MS = 30_000;
 
 // =============================================================================
 // Betfair API Response Types
@@ -232,17 +235,22 @@ export class BetfairClient implements MarketClient {
    */
   private async loginInteractive(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.ssoUrl}/login`, {
-        method: 'POST',
-        headers: {
-          'X-Application': this.appKey,
-          'Content-Type': 'application/x-www-form-urlencoded',
+      const response = await fetchWithRetry(
+        `${this.ssoUrl}/login`,
+        {
+          method: 'POST',
+          headers: {
+            'X-Application': this.appKey,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: new URLSearchParams({
+            username: this.username,
+            password: this.password,
+          }),
         },
-        body: new URLSearchParams({
-          username: this.username,
-          password: this.password,
-        }),
-      });
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.loginInteractive"
+      );
 
       if (!response.ok) {
         console.error(`Betfair login failed: ${response.status} ${response.statusText}`);
@@ -272,12 +280,17 @@ export class BetfairClient implements MarketClient {
     if (!this.sessionToken) return false;
 
     try {
-      const response = await fetch(`${this.ssoUrl}/keepAlive`, {
-        headers: {
-          'X-Application': this.appKey,
-          'X-Authentication': this.sessionToken,
+      const response = await fetchWithRetry(
+        `${this.ssoUrl}/keepAlive`,
+        {
+          headers: {
+            'X-Application': this.appKey,
+            'X-Authentication': this.sessionToken,
+          },
         },
-      });
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.keepAlive"
+      );
 
       if (response.ok) {
         this.tokenExpiry = new Date(Date.now() + 15 * 60 * 1000);
@@ -331,11 +344,16 @@ export class BetfairClient implements MarketClient {
       }
 
       // Step 2: Test Exchange API access
-      const response = await fetch(`${this.baseUrl}/listEventTypes/`, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({ filter: {} }),
-      });
+      const response = await fetchWithRetry(
+        `${this.baseUrl}/listEventTypes/`,
+        {
+          method: 'POST',
+          headers: this.getHeaders(),
+          body: JSON.stringify({ filter: {} }),
+        },
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.testAuth"
+      );
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -383,23 +401,26 @@ export class BetfairClient implements MarketClient {
     }
 
     const maxResults = options.maxResults || 50;
-    const queryLower = query.toLowerCase();
-
     try {
       // Search market catalogue with text query and optional event type filter
-      const filter: Record<string, any> = { textQuery: query };
+      const filter: Record<string, unknown> = { textQuery: query };
       if (options.eventTypeIds) {
         filter.eventTypeIds = options.eventTypeIds;
       }
-      const catalogueResponse = await fetch(`${this.baseUrl}/listMarketCatalogue/`, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({
-          filter,
-          maxResults: maxResults,
-          marketProjection: ['EVENT', 'EVENT_TYPE', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
-        }),
-      });
+      const catalogueResponse = await fetchWithRetry(
+        `${this.baseUrl}/listMarketCatalogue/`,
+        {
+          method: 'POST',
+          headers: this.getHeaders(),
+          body: JSON.stringify({
+            filter,
+            maxResults: maxResults,
+            marketProjection: ['EVENT', 'EVENT_TYPE', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
+          }),
+        },
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.listMarketCatalogue"
+      );
 
       if (!catalogueResponse.ok) {
         const errorText = await catalogueResponse.text();
@@ -425,16 +446,21 @@ export class BetfairClient implements MarketClient {
 
       // Get market books for prices and volumes
       const marketIds = catalogues.map(c => c.marketId);
-      const booksResponse = await fetch(`${this.baseUrl}/listMarketBook/`, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({
-          marketIds,
-          priceProjection: {
-            priceData: ['EX_BEST_OFFERS', 'EX_TRADED'],
-          },
-        }),
-      });
+      const booksResponse = await fetchWithRetry(
+        `${this.baseUrl}/listMarketBook/`,
+        {
+          method: 'POST',
+          headers: this.getHeaders(),
+          body: JSON.stringify({
+            marketIds,
+            priceProjection: {
+              priceData: ['EX_BEST_OFFERS', 'EX_TRADED'],
+            },
+          }),
+        },
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.listMarketBook"
+      );
 
       let books: BetfairMarketBook[] = [];
       if (booksResponse.ok) {
@@ -465,15 +491,20 @@ export class BetfairClient implements MarketClient {
 
     try {
       // Get catalogue
-      const catalogueResponse = await fetch(`${this.baseUrl}/listMarketCatalogue/`, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({
-          filter: { marketIds: [marketId] },
-          maxResults: 1,
-          marketProjection: ['EVENT', 'EVENT_TYPE', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
-        }),
-      });
+      const catalogueResponse = await fetchWithRetry(
+        `${this.baseUrl}/listMarketCatalogue/`,
+        {
+          method: 'POST',
+          headers: this.getHeaders(),
+          body: JSON.stringify({
+            filter: { marketIds: [marketId] },
+            maxResults: 1,
+            marketProjection: ['EVENT', 'EVENT_TYPE', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
+          }),
+        },
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.getMarket.listMarketCatalogue"
+      );
 
       if (!catalogueResponse.ok) {
         throw new Error(`Betfair API error: ${catalogueResponse.status} ${catalogueResponse.statusText}`);
@@ -483,14 +514,19 @@ export class BetfairClient implements MarketClient {
       if (catalogues.length === 0) return null;
 
       // Get book
-      const bookResponse = await fetch(`${this.baseUrl}/listMarketBook/`, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({
-          marketIds: [marketId],
-          priceProjection: { priceData: ['EX_BEST_OFFERS', 'EX_TRADED'] },
-        }),
-      });
+      const bookResponse = await fetchWithRetry(
+        `${this.baseUrl}/listMarketBook/`,
+        {
+          method: 'POST',
+          headers: this.getHeaders(),
+          body: JSON.stringify({
+            marketIds: [marketId],
+            priceProjection: { priceData: ['EX_BEST_OFFERS', 'EX_TRADED'] },
+          }),
+        },
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.getMarket.listMarketBook"
+      );
 
       let book: BetfairMarketBook | undefined;
       if (bookResponse.ok) {
@@ -517,11 +553,16 @@ export class BetfairClient implements MarketClient {
     }
 
     try {
-      const response = await fetch(`${this.baseUrl}/listEventTypes/`, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({ filter: {} }),
-      });
+      const response = await fetchWithRetry(
+        `${this.baseUrl}/listEventTypes/`,
+        {
+          method: 'POST',
+          headers: this.getHeaders(),
+          body: JSON.stringify({ filter: {} }),
+        },
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Betfair.listEventTypes"
+      );
 
       if (!response.ok) {
         throw new Error(`Betfair API error: ${response.status} ${response.statusText}`);
@@ -542,17 +583,22 @@ export class BetfairClient implements MarketClient {
    * Generic POST helper for Betfair JSON-RPC style endpoints.
    * Handles auth, error parsing, and typed response.
    */
-  private async apiPost<T>(url: string, body: Record<string, any> = {}): Promise<T> {
+  private async apiPost<T>(url: string, body: Record<string, unknown> = {}): Promise<T> {
     const authed = await this.ensureAuth();
     if (!authed) {
       throw new Error('Betfair authentication failed');
     }
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify(body),
-    });
+    const response = await fetchWithRetry(
+      url,
+      {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify(body),
+      },
+      { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+      "Betfair.apiPost"
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -604,7 +650,7 @@ export class BetfairClient implements MarketClient {
     let moreAvailable = false;
 
     for (let page = 0; page < maxPages; page++) {
-      const body: Record<string, any> = { fromRecord, recordCount };
+      const body: Record<string, unknown> = { fromRecord, recordCount };
       if (options.itemDateRange) body.itemDateRange = options.itemDateRange;
       if (options.includeItem) body.includeItem = options.includeItem;
 
@@ -646,7 +692,7 @@ export class BetfairClient implements MarketClient {
     let moreAvailable = false;
 
     for (let page = 0; page < maxPages; page++) {
-      const body: Record<string, any> = { fromRecord, recordCount };
+      const body: Record<string, unknown> = { fromRecord, recordCount };
       if (options.orderProjection) body.orderProjection = options.orderProjection;
       if (options.marketIds) body.marketIds = options.marketIds;
       if (options.dateRange) body.dateRange = options.dateRange;
@@ -692,7 +738,7 @@ export class BetfairClient implements MarketClient {
     let moreAvailable = false;
 
     for (let page = 0; page < maxPages; page++) {
-      const body: Record<string, any> = {
+      const body: Record<string, unknown> = {
         betStatus: options.betStatus,
         includeItemDescription: true,
         fromRecord,

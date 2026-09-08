@@ -1,15 +1,23 @@
 /**
  * Polymarket API Client
  *
- * Uses web scraping of polymarket.com search page for reliable text search.
- * The gamma-api.polymarket.com doesn't support proper text search filters.
+ * Uses Gamma's public search endpoint, then hydrates each event by slug so
+ * multi-outcome markets are never limited to a search preview.
  */
 
 import type { UnifiedMarket, MarketClient, SearchOptions, PolymarketConfig, Outcome } from './types.js';
 import { polymarketOddsToPercent, usdcToUsd, nowISO } from './utils.js';
+import { fetchWithRetry } from './retry.js';
+
+const REQUEST_TIMEOUT_MS = 30_000;
+const CLOB_PRICE_TIMEOUT_MS = 5_000;
+
+// Max concurrent Gamma hydration fetches — bounds fan-out against the
+// rate-limited Gamma endpoint when a search returns many multi-candidate events.
+const HYDRATION_CONCURRENCY = 8;
 
 // =============================================================================
-// Polymarket Search Result Types (from __NEXT_DATA__)
+// Polymarket search result types
 // =============================================================================
 
 interface PolymarketSearchEvent {
@@ -61,19 +69,165 @@ interface GammaMarket {
   outcomes?: string;
 }
 
-interface NextDataSearchResponse {
-  pageProps: {
-    dehydratedState: {
-      queries: Array<{
-        state: {
-          data: {
-            pages: Array<{
-              results: PolymarketSearchEvent[];
-            }>;
-          };
-        };
-      }>;
-    };
+/**
+ * A sub-market as returned by the Gamma API `/events` endpoint. It is a superset
+ * of the fields we read; numeric fields (volume/liquidity) arrive as numbers here
+ * whereas the search page serves them as strings.
+ */
+interface GammaEventMarket {
+  id?: string;
+  question?: string;
+  conditionId?: string;
+  slug?: string;
+  endDate?: string;
+  liquidity?: string | number;
+  volume?: string | number;
+  outcomes?: string | string[];
+  outcomePrices?: string | string[];
+  clobTokenIds?: string | string[];
+  active?: boolean;
+  closed?: boolean;
+  acceptingOrders?: boolean;
+}
+
+interface GammaEvent {
+  id?: string | number;
+  ticker?: string;
+  slug?: string;
+  title?: string;
+  question?: string;
+  description?: string;
+  startDate?: string;
+  endDate?: string;
+  image?: string;
+  active?: boolean;
+  closed?: boolean;
+  archived?: boolean;
+  liquidity?: string | number;
+  volume?: string | number;
+  volume24hr?: string | number;
+  enableOrderBook?: boolean;
+  markets?: GammaEventMarket[];
+}
+
+interface GammaPublicSearchResponse {
+  events?: GammaEvent[];
+}
+
+// =============================================================================
+// Pure helpers (exported for unit testing)
+// =============================================================================
+
+/**
+ * Parse a field that Polymarket serves as either a JSON-encoded string or an
+ * already-decoded array (the two shapes appear interchangeably across endpoints).
+ * Gamma can deliver prices as numbers, so every element is coerced to a string —
+ * callers do `.toLowerCase()` on names and `parseFloat(String(...))` on prices,
+ * both safe on strings.
+ */
+function parseStringOrArray(value: string | Array<string | number> | undefined): string[] {
+  if (Array.isArray(value)) {
+    return value.map(element => String(element));
+  }
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(element => String(element)) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build the sorted outcome list for a multi-candidate event, one outcome per
+ * sub-market. Each sub-market is a Yes/No question ("Will Spain win…?") whose
+ * "Yes" price is that candidate's win probability.
+ *
+ * Pure and independent of result-set size: 60 sub-markets in → 60 outcomes out
+ * (this is the consumer of the truncation fix — no implicit 5-cap).
+ */
+export function buildOutcomesFromMarkets(markets: PolymarketSearchMarket[]): Outcome[] {
+  const outcomes: Outcome[] = [];
+
+  for (const market of markets) {
+    const outcomeNames = parseStringOrArray(market.outcomes);
+    const outcomePrices = parseStringOrArray(market.outcomePrices);
+    if (outcomeNames.length === 0) {
+      continue;
+    }
+
+    // The "Yes" price is this candidate's probability; fall back to the first price.
+    const yesIndex = outcomeNames.findIndex(name => name.toLowerCase() === 'yes');
+    const priceIndex = yesIndex >= 0 ? yesIndex : 0;
+    const yesPrice = parseFloat(String(outcomePrices[priceIndex])) || 0;
+
+    // Carry the "Yes" CLOB token ID so spread enrichment can skip a Gamma round-trip.
+    const tokenIds = parseStringOrArray(market.clobTokenIds);
+    const yesTokenId = tokenIds[priceIndex];
+
+    outcomes.push({
+      name: market.question,
+      odds: polymarketOddsToPercent(yesPrice),
+      source: yesTokenId || undefined,
+    });
+  }
+
+  // Favourite first.
+  outcomes.sort((a, b) => b.odds - a.odds);
+  return outcomes;
+}
+
+/**
+ * Coerce a Gamma API market object into the search-page market shape so the
+ * existing normalizers can consume it unchanged. Gamma serves numeric
+ * volume/liquidity, which we stringify to match `PolymarketSearchMarket`.
+ */
+export function gammaMarketToSearchMarket(market: GammaEventMarket): PolymarketSearchMarket {
+  const toStringField = (value: string | number | undefined): string =>
+    value === undefined || value === null ? '' : String(value);
+
+  return {
+    id: market.id ?? '',
+    question: market.question ?? '',
+    conditionId: market.conditionId ?? '',
+    slug: market.slug ?? '',
+    endDate: market.endDate ?? '',
+    liquidity: toStringField(market.liquidity),
+    volume: toStringField(market.volume),
+    outcomePrices: market.outcomePrices ?? '[]',
+    outcomes: market.outcomes ?? '[]',
+    clobTokenIds: market.clobTokenIds,
+    active: market.active ?? false,
+    closed: market.closed ?? false,
+    acceptingOrders: market.acceptingOrders ?? false,
+  };
+}
+
+export function gammaEventToSearchEvent(event: GammaEvent): PolymarketSearchEvent {
+  const numberField = (value: string | number | undefined): number => {
+    const parsed = Number(value ?? 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
+  return {
+    id: String(event.id ?? event.slug ?? ''),
+    ticker: event.ticker ?? '',
+    slug: event.slug ?? '',
+    title: event.title ?? event.question ?? '',
+    description: event.description,
+    startDate: event.startDate,
+    endDate: event.endDate ?? '',
+    image: event.image,
+    active: event.active ?? false,
+    closed: event.closed ?? false,
+    archived: event.archived ?? false,
+    liquidity: numberField(event.liquidity),
+    volume: numberField(event.volume),
+    volume24hr: numberField(event.volume24hr),
+    enableOrderBook: event.enableOrderBook,
+    markets: (event.markets ?? []).map(gammaMarketToSearchMarket),
   };
 }
 
@@ -86,7 +240,7 @@ export class PolymarketClient implements MarketClient {
   private enabled: boolean;
 
   constructor(config: PolymarketConfig) {
-    this.baseUrl = config.baseUrl || 'https://polymarket.com';
+    this.baseUrl = (config.baseUrl || 'https://gamma-api.polymarket.com').replace(/\/$/, '');
     this.enabled = config.enabled !== false;
   }
 
@@ -95,8 +249,7 @@ export class PolymarketClient implements MarketClient {
   }
 
   /**
-   * Search markets by scraping polymarket.com search results
-   * This is more reliable than the gamma-api which lacks proper text search
+   * Search active events through Gamma public search, then hydrate by slug.
    */
   async search(query: string, options: SearchOptions = {}): Promise<UnifiedMarket[]> {
     if (!this.enabled) return [];
@@ -104,43 +257,31 @@ export class PolymarketClient implements MarketClient {
     const limit = options.maxResults || 50;
 
     try {
-      // Fetch the search page HTML
-      const searchUrl = `https://polymarket.com/search?_q=${encodeURIComponent(query)}`;
-      const response = await fetch(searchUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; BettingMarketsBot/1.0)',
-          'Accept': 'text/html,application/xhtml+xml',
+      const searchUrl = new URL(`${this.baseUrl}/public-search`);
+      searchUrl.searchParams.set('q', query);
+      searchUrl.searchParams.set('limit_per_type', String(Math.min(Math.max(limit, 1), 100)));
+      searchUrl.searchParams.set('events_status', 'active');
+      const response = await fetchWithRetry(
+        searchUrl.toString(),
+        {
+          headers: {
+            'Accept': 'application/json',
+          },
         },
-      });
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Polymarket.search"
+      );
 
       if (!response.ok) {
         throw new Error(`Polymarket search failed: ${response.status}`);
       }
 
-      const html = await response.text();
+      const payload = await response.json() as GammaPublicSearchResponse;
+      const events = (payload.events ?? [])
+        .map(gammaEventToSearchEvent)
+        .filter(event => event.id && event.slug && event.title);
 
-      // Extract __NEXT_DATA__ script content
-      // The tag may have additional attributes like crossorigin="anonymous"
-      const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json"[^>]*>(.+?)<\/script>/s);
-      if (!nextDataMatch) {
-        throw new Error('Could not find __NEXT_DATA__ in Polymarket response');
-      }
-
-      const nextData = JSON.parse(nextDataMatch[1]);
-
-      // Extract search results from dehydrated state
-      // Structure: data.props.pageProps.dehydratedState.queries
-      const pageProps = nextData.props?.pageProps || nextData.pageProps;
-      const queries = pageProps?.dehydratedState?.queries || [];
-      const searchQuery = queries.find((q: { state?: { data?: { pages?: unknown[] } } }) => q.state?.data?.pages);
-      const pages = searchQuery?.state?.data?.pages || [];
-      const events: PolymarketSearchEvent[] = [];
-
-      for (const page of pages) {
-        if (page.results) {
-          events.push(...page.results);
-        }
-      }
+      await this.hydrateEvents(events);
 
       // Convert events to unified markets
       const markets: UnifiedMarket[] = [];
@@ -180,33 +321,28 @@ export class PolymarketClient implements MarketClient {
     if (!this.enabled) return null;
 
     try {
-      // Fetch the event page
-      const eventUrl = `https://polymarket.com/event/${slugOrId}`;
-      const response = await fetch(eventUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; BettingMarketsBot/1.0)',
-          'Accept': 'text/html,application/xhtml+xml',
+      const slug = this.extractEventSlug(slugOrId);
+      const eventUrl = `${this.baseUrl}/events?slug=${encodeURIComponent(slug)}`;
+      const response = await fetchWithRetry(
+        eventUrl,
+        {
+          headers: {
+            'Accept': 'application/json',
+          },
         },
-      });
+        { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+        "Polymarket.getMarket"
+      );
 
       if (response.status === 404) return null;
       if (!response.ok) {
         throw new Error(`Polymarket getMarket failed: ${response.status}`);
       }
 
-      const html = await response.text();
-
-      // Extract __NEXT_DATA__ script content
-      const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json"[^>]*>(.+?)<\/script>/s);
-      if (!nextDataMatch) {
-        return null;
-      }
-
-      const nextData = JSON.parse(nextDataMatch[1]);
-      const pageProps = nextData.props?.pageProps || nextData.pageProps;
-      const event = pageProps?.dehydratedState?.queries?.[0]?.state?.data;
-
-      if (!event) return null;
+      const payload = await response.json() as GammaEvent[];
+      const gammaEvent = payload[0];
+      if (!gammaEvent) return null;
+      const event = gammaEventToSearchEvent(gammaEvent);
 
       let market: UnifiedMarket;
       if (!event.markets || event.markets.length === 0) {
@@ -225,6 +361,11 @@ export class PolymarketClient implements MarketClient {
       console.error('Polymarket getMarket error:', error);
       throw error;
     }
+  }
+
+  private extractEventSlug(value: string): string {
+    const match = value.match(/\/event\/([^/?#]+)/);
+    return decodeURIComponent(match?.[1] ?? value).trim();
   }
 
   /**
@@ -302,47 +443,9 @@ export class PolymarketClient implements MarketClient {
    * Each sub-market has Yes/No outcomes — we extract the "Yes" price as the candidate's probability.
    */
   private normalizeMultiMarketEvent(event: PolymarketSearchEvent): UnifiedMarket {
-    const outcomes: Outcome[] = [];
-
-    for (const market of event.markets) {
-      try {
-        const outcomeNames: string[] = Array.isArray(market.outcomes)
-          ? market.outcomes
-          : JSON.parse(market.outcomes || '[]');
-        const outcomePrices: (string | number)[] = Array.isArray(market.outcomePrices)
-          ? market.outcomePrices
-          : JSON.parse(market.outcomePrices || '[]');
-
-        // Find the "Yes" price — this is the probability of this candidate/outcome
-        const yesIndex = outcomeNames.findIndex(n => n.toLowerCase() === 'yes');
-        const yesPrice = yesIndex >= 0
-          ? parseFloat(String(outcomePrices[yesIndex])) || 0
-          : parseFloat(String(outcomePrices[0])) || 0;
-
-        // Extract CLOB token IDs if available (for spread enrichment later)
-        let clobTokenIds: string[] | undefined;
-        try {
-          clobTokenIds = Array.isArray(market.clobTokenIds)
-            ? market.clobTokenIds
-            : market.clobTokenIds ? JSON.parse(market.clobTokenIds) : undefined;
-        } catch { /* ignore */ }
-
-        // Use "Yes" token ID for spread lookup (first token = Yes outcome)
-        const yesTokenId = clobTokenIds?.[yesIndex >= 0 ? yesIndex : 0];
-
-        outcomes.push({
-          name: market.question,
-          odds: polymarketOddsToPercent(yesPrice),
-          // Only store actual CLOB token IDs (long hex strings), not conditionIds
-          source: yesTokenId || undefined,
-        });
-      } catch {
-        // Skip unparseable markets
-      }
-    }
-
-    // Sort by odds descending (favourite first)
-    outcomes.sort((a, b) => b.odds - a.odds);
+    // One outcome per sub-market, favourite first. Scales to the full (hydrated)
+    // market list — no implicit cap on the number of candidates.
+    const outcomes = buildOutcomesFromMarkets(event.markets);
 
     const volume = event.volume || 0;
     const liquidity = event.liquidity || 0;
@@ -443,14 +546,18 @@ export class PolymarketClient implements MarketClient {
   private async fetchClobPrices(tokenId: string): Promise<[number | null, number | null]> {
     try {
       const [buyResp, sellResp] = await Promise.all([
-        fetch(`https://clob.polymarket.com/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`, {
-          headers: { 'Accept': 'application/json' },
-          signal: AbortSignal.timeout(5000),
-        }),
-        fetch(`https://clob.polymarket.com/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`, {
-          headers: { 'Accept': 'application/json' },
-          signal: AbortSignal.timeout(5000),
-        }),
+        fetchWithRetry(
+          `https://clob.polymarket.com/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`,
+          { headers: { 'Accept': 'application/json' } },
+          { maxRetries: 3, timeoutMs: CLOB_PRICE_TIMEOUT_MS },
+          "Polymarket.clobPriceBuy"
+        ),
+        fetchWithRetry(
+          `https://clob.polymarket.com/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`,
+          { headers: { 'Accept': 'application/json' } },
+          { maxRetries: 3, timeoutMs: CLOB_PRICE_TIMEOUT_MS },
+          "Polymarket.clobPriceSell"
+        ),
       ]);
 
       if (!buyResp.ok || !sellResp.ok) return [null, null];
@@ -468,6 +575,55 @@ export class PolymarketClient implements MarketClient {
   }
 
   /**
+   * Replace public-search previews with complete event payloads. Events are
+   * mutated in place. Hydration is best-effort and bounded.
+   */
+  private async hydrateEvents(events: PolymarketSearchEvent[]): Promise<void> {
+    for (let start = 0; start < events.length; start += HYDRATION_CONCURRENCY) {
+      const batch = events.slice(start, start + HYDRATION_CONCURRENCY);
+      await Promise.all(batch.map(event => this.hydrateEventFromGamma(event)));
+    }
+  }
+
+  /** Replace one event's truncated preview with its full Gamma market list (best-effort). */
+  private async hydrateEventFromGamma(event: PolymarketSearchEvent): Promise<void> {
+    try {
+      const fullMarkets = await this.fetchGammaEventMarkets(event.slug);
+      if (fullMarkets.length > 0) {
+        event.markets = fullMarkets;
+      }
+    } catch {
+      // Keep the truncated preview on failure.
+    }
+  }
+
+  /**
+   * Fetch the complete sub-market list for an event from the Gamma API by slug.
+   * Gamma returns every market (not the truncated search preview). Returns an
+   * empty array on any failure so the caller can fall back to the preview.
+   */
+  private async fetchGammaEventMarkets(slug: string): Promise<PolymarketSearchMarket[]> {
+    if (!slug) {
+      return [];
+    }
+
+    const response = await fetchWithRetry(
+      `${this.baseUrl}/events?slug=${encodeURIComponent(slug)}`,
+      { headers: { 'Accept': 'application/json' } },
+      { maxRetries: 3, timeoutMs: REQUEST_TIMEOUT_MS },
+      "Polymarket.gammaEventMarkets"
+    );
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const events = await response.json() as Array<{ markets?: GammaEventMarket[] }>;
+    const gammaMarkets = events[0]?.markets ?? [];
+    return gammaMarkets.map(gammaMarketToSearchMarket);
+  }
+
+  /**
    * Fetch CLOB token IDs from Gamma API for all markets in an event.
    * Returns a map of question → Yes token ID.
    */
@@ -480,12 +636,11 @@ export class PolymarketClient implements MarketClient {
       if (!slugMatch) return tokenMap;
 
       const slug = slugMatch[1];
-      const response = await fetch(
-        `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`,
-        {
-          headers: { 'Accept': 'application/json' },
-          signal: AbortSignal.timeout(5000),
-        }
+      const response = await fetchWithRetry(
+        `${this.baseUrl}/events?slug=${encodeURIComponent(slug)}`,
+        { headers: { 'Accept': 'application/json' } },
+        { maxRetries: 3, timeoutMs: CLOB_PRICE_TIMEOUT_MS },
+        "Polymarket.gammaEvents"
       );
 
       if (!response.ok) return tokenMap;

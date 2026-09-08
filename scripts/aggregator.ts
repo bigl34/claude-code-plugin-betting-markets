@@ -9,11 +9,11 @@
  * - Unified format: Normalizes odds/prices to percentages and USD volume
  * - Graceful degradation: Returns partial results if some platforms fail
  * - Markdown output: Formatted tables for easy reading
- * - Polymarket dedup: FinFeedAPI primary, native scraper as fallback
+ * - Polymarket dedup: Gamma primary, FinFeedAPI disabled for Polymarket
  * - Credit tracking: The Odds API budget management
  *
  * Supported platforms:
- * - Polymarket: Crypto prediction market (native scraper or via FinFeedAPI)
+ * - Polymarket: Crypto prediction market (Gamma public search)
  * - Betfair: Traditional betting exchange (requires API credentials)
  * - The Odds API: Aggregated bookmaker odds (API key + credit budget)
  * - Kalshi, Manifold, Myriad: Via FinFeedAPI
@@ -21,9 +21,6 @@
  * Currencies: Betfair GBP converted to USD using configurable rate.
  */
 
-import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
 import type {
   UnifiedMarket,
   SearchOptions,
@@ -45,11 +42,8 @@ import { PolymarketClient } from './polymarket-client.js';
 import { BetfairClient } from './betfair-client.js';
 import { TheOddsClient } from './theodds-client.js';
 import { FinFeedClient } from './finfeed-client.js';
-import { sortMarkets, filterByMinVolume, formatMarkdownTable, nowISO, formatGbpWithUsd, gbpToUsd } from './utils.js';
-
-// ES module __dirname equivalent
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { sortMarkets, filterByMinVolume, formatMarkdownTable, nowISO, formatGbpWithUsd } from './utils.js';
+import { loadBettingMarketsConfig } from './config.js';
 
 // ============================================
 // AGGREGATOR
@@ -62,10 +56,7 @@ export class BettingMarketsAggregator {
   private finfeed: FinFeedClient | null;
   private gbpToUsdRate: number;
 
-  constructor() {
-    // When compiled, __dirname is dist/, so look in parent for config.json
-    const configPath = join(__dirname, '..', 'config.json');
-    const config: Config = JSON.parse(readFileSync(configPath, 'utf-8'));
+  constructor(config: Config = loadBettingMarketsConfig()) {
     this.gbpToUsdRate = config.settings?.gbpToUsd || 1.27;
     this.polymarket = new PolymarketClient(config.polymarket);
     this.betfair = new BetfairClient(config.betfair, this.gbpToUsdRate);
@@ -80,9 +71,8 @@ export class BettingMarketsAggregator {
   /**
    * Searches all enabled platforms in parallel.
    *
-   * Polymarket deduplication:
-   * - If FinFeedAPI handles Polymarket, skip the native scraper
-   * - If FinFeedAPI fails for Polymarket specifically, retry with native scraper
+   * Polymarket is served by Gamma directly; FinFeedAPI covers the other
+   * prediction-market exchanges.
    *
    * @param query - Search query for market names/descriptions
    * @param options - Search options
@@ -95,9 +85,8 @@ export class BettingMarketsAggregator {
 
     const targetPlatform = options.platform;
 
-    // Native scraper is always preferred for Polymarket (has real server-side
-    // search via polymarket.com). FinFeedAPI's client-side filtering of 200
-    // rows misses most markets — especially political/niche ones.
+    // Gamma public search is preferred for Polymarket. FinFeedAPI's client-side
+    // filtering misses many political and niche markets.
     const finfeedHandlesPolymarket = false;
 
     // Build search promises
@@ -105,11 +94,12 @@ export class BettingMarketsAggregator {
       platform: Platform;
       markets?: UnifiedMarket[];
       error?: string;
+      statusAlreadyRecorded?: boolean;
     };
 
     const searchPromises: Promise<SearchResult>[] = [];
 
-    // ── Polymarket (native scraper) ─────────────────────────────
+    // ── Polymarket (Gamma public search) ────────────────────────
     // Skip if FinFeedAPI handles it AND we're not specifically targeting polymarket
     const useNativePolymarket = this.polymarket.isEnabled() &&
       (!targetPlatform || targetPlatform === 'polymarket') &&
@@ -184,7 +174,11 @@ export class BettingMarketsAggregator {
                 }
               }
 
-              return { platform: 'polymarket' as const, markets }; // Platform here is irrelevant — we set per-platform above
+              return {
+                platform: 'polymarket' as const,
+                markets,
+                statusAlreadyRecorded: true,
+              }; // FinFeed records the actual exchange statuses above.
             })
             .catch(error => {
               const errorMsg = error instanceof Error ? error.message : String(error);
@@ -192,7 +186,7 @@ export class BettingMarketsAggregator {
                 platforms[exchange as Platform] = { status: 'error', error: errorMsg };
               }
               warnings.push(`finfeed: ${errorMsg}`);
-              return { platform: 'polymarket' as const, error: errorMsg };
+              return { platform: 'polymarket' as const, error: errorMsg, statusAlreadyRecorded: true };
             })
         );
       }
@@ -205,7 +199,7 @@ export class BettingMarketsAggregator {
     for (const result of results) {
       if (result.error) {
         // Only set platform status if not already set by FinFeedAPI batch handler
-        if (!platforms[result.platform]) {
+        if (!result.statusAlreadyRecorded && !platforms[result.platform]) {
           platforms[result.platform] = {
             status: 'error',
             error: result.error,
@@ -215,7 +209,7 @@ export class BettingMarketsAggregator {
       } else if (result.markets) {
         allMarkets = allMarkets.concat(result.markets);
         // Only set platform status if not already set by FinFeedAPI batch handler
-        if (!platforms[result.platform]) {
+        if (!result.statusAlreadyRecorded && !platforms[result.platform]) {
           platforms[result.platform] = {
             status: 'success',
             count: result.markets.length,
@@ -235,7 +229,7 @@ export class BettingMarketsAggregator {
         const fallbackMarkets = await this.polymarket.search(query, options);
         platforms.polymarket = { status: 'success', count: fallbackMarkets.length };
         allMarkets = allMarkets.concat(fallbackMarkets);
-        warnings.push('polymarket: fell back to native scraper (FinFeedAPI failed)');
+        warnings.push('polymarket: fell back to Gamma public search (FinFeedAPI failed)');
       } catch (error) {
         // Both failed — keep the original error
         warnings.push(`polymarket fallback: ${error instanceof Error ? error.message : String(error)}`);
@@ -280,11 +274,11 @@ export class BettingMarketsAggregator {
   private getFinfeedTargetExchanges(targetPlatform?: Platform): string[] {
     if (!this.finfeed?.isEnabled()) return [];
 
-    // Polymarket excluded — native scraper has real server-side search
+    // Polymarket excluded — Gamma has real server-side search
     const allExchanges = ['kalshi', 'manifold', 'myriad'];
 
     if (targetPlatform) {
-      if (targetPlatform === 'polymarket') return []; // Native scraper handles this
+      if (targetPlatform === 'polymarket') return []; // Gamma handles this
       if (this.finfeed.handlesExchange(targetPlatform)) {
         return [targetPlatform];
       }
@@ -440,13 +434,24 @@ export class BettingMarketsAggregator {
     return this.theodds.getFormattedCreditStatus();
   }
 
+  async refreshCreditStatus(): Promise<CreditStatus> {
+    if (!this.theodds?.isEnabled()) {
+      throw new Error('The Odds API is not enabled in the rendered betting markets configuration.');
+    }
+    return this.theodds.refreshCreditStatus();
+  }
+
+  formatGbp(amount: number): string {
+    return formatGbpWithUsd(amount, this.gbpToUsdRate);
+  }
+
   // ============================================
   // SPORTS LIST (The Odds API)
   // ============================================
 
   async listSports(): Promise<{ key: string; title: string; group: string; active: boolean }[]> {
     if (!this.theodds?.isEnabled()) {
-      throw new Error('The Odds API is not enabled. Add API key to config.json.');
+      throw new Error('The Odds API is not enabled in the rendered betting markets configuration.');
     }
     const sports = await this.theodds.listSports();
     return sports.map(s => ({
@@ -587,8 +592,8 @@ export class BettingMarketsAggregator {
   // UTILITY
   // ============================================
 
-  /** Returns list of available CLI commands with their options. */
-  listTools(): { name: string; description: string; options?: string[] }[] {
+  /** Returns list of available CLI commands without loading provider config. */
+  static listTools(): { name: string; description: string; options?: string[] }[] {
     return [
       {
         name: 'search',
@@ -651,4 +656,10 @@ export class BettingMarketsAggregator {
       },
     ];
   }
+
+  /** Backwards-compatible instance form for existing library consumers. */
+  listTools(): { name: string; description: string; options?: string[] }[] {
+    return BettingMarketsAggregator.listTools();
+  }
 }
+
